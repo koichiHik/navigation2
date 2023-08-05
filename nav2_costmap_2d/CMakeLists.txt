@@ -48,6 +48,7 @@ add_library(nav2_costmap_2d_core SHARED
   src/footprint.cpp
   src/costmap_layer.cpp
   src/observation_buffer.cpp
+  src/observation_buffer_with_base.cpp
   src/clear_costmap_service.cpp
   src/footprint_collision_checker.cpp
   plugins/costmap_filters/costmap_filter.cpp
@@ -86,6 +87,7 @@ add_library(layers SHARED
   plugins/obstacle_layer.cpp
   plugins/obstacle_decay_layer.cpp
   src/observation_buffer.cpp
+  src/observation_buffer_with_base.cpp
   plugins/voxel_layer.cpp
   plugins/range_sensor_layer.cpp
   plugins/denoise_layer.cpp

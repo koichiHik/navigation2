@@ -34,7 +34,7 @@
  *
  * Author: Eitan Marder-Eppstein
  *********************************************************************/
-#include "nav2_costmap_2d/observation_buffer.hpp"
+#include "nav2_costmap_2d/observation_buffer_with_base.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -47,7 +47,7 @@
 using namespace std::chrono_literals;
 
 namespace nav2_costmap_2d {
-ObservationBuffer::ObservationBuffer(
+ObservationBufferWithBase::ObservationBufferWithBase(
     const nav2_util::LifecycleNode::WeakPtr& parent, std::string topic_name,
     double observation_keep_time, double expected_update_rate,
     double min_obstacle_height, double max_obstacle_height,
@@ -76,9 +76,9 @@ ObservationBuffer::ObservationBuffer(
   last_updated_ = node->now();
 }
 
-ObservationBuffer::~ObservationBuffer() {}
+ObservationBufferWithBase::~ObservationBufferWithBase() {}
 
-void ObservationBuffer::bufferCloud(
+void ObservationBufferWithBase::bufferCloud(
     const sensor_msgs::msg::PointCloud2& cloud) {
   geometry_msgs::msg::PointStamped global_origin;
 
@@ -177,7 +177,7 @@ void ObservationBuffer::bufferCloud(
 }
 
 // returns a copy of the observations
-void ObservationBuffer::getObservations(
+void ObservationBufferWithBase::getObservations(
     std::vector<Observation>& observations) {
   // first... let's make sure that we don't have any stale observations
   purgeStaleObservations();
@@ -190,7 +190,7 @@ void ObservationBuffer::getObservations(
   }
 }
 
-void ObservationBuffer::purgeStaleObservations() {
+void ObservationBufferWithBase::purgeStaleObservations() {
   if (!observation_list_.empty()) {
     std::list<Observation>::iterator obs_it = observation_list_.begin();
     // if we're keeping observations for no time... then we'll only keep one
@@ -215,7 +215,7 @@ void ObservationBuffer::purgeStaleObservations() {
   }
 }
 
-bool ObservationBuffer::isCurrent() const {
+bool ObservationBufferWithBase::isCurrent() const {
   if (expected_update_rate_ == rclcpp::Duration(0.0s)) {
     return true;
   }
@@ -232,5 +232,7 @@ bool ObservationBuffer::isCurrent() const {
   return current;
 }
 
-void ObservationBuffer::resetLastUpdated() { last_updated_ = clock_->now(); }
+void ObservationBufferWithBase::resetLastUpdated() {
+  last_updated_ = clock_->now();
+}
 }  // namespace nav2_costmap_2d

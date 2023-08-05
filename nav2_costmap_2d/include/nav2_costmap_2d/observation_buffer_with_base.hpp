@@ -35,8 +35,8 @@
  *
  * Author: Eitan Marder-Eppstein
  *********************************************************************/
-#ifndef NAV2_COSTMAP_2D__OBSERVATION_BUFFER_HPP_
-#define NAV2_COSTMAP_2D__OBSERVATION_BUFFER_HPP_
+#ifndef NAV2_COSTMAP_2D__OBSERVATION_BUFFER_WITH_BASE_HPP_
+#define NAV2_COSTMAP_2D__OBSERVATION_BUFFER_WITH_BASE_HPP_
 
 #include <vector>
 #include <list>
@@ -54,10 +54,10 @@
 namespace nav2_costmap_2d
 {
 /**
- * @class ObservationBuffer
+ * @class ObservationBufferWithBase
  * @brief Takes in point clouds from sensors, transforms them to the desired frame, and stores them
  */
-class ObservationBuffer
+class ObservationBufferWithBase
 {
 public:
   /**
@@ -76,7 +76,7 @@ public:
    * @param  sensor_frame The frame of the origin of the sensor, can be left blank to be read from the messages
    * @param  tf_tolerance The amount of time to wait for a transform to be available when setting a new global frame
    */
-  ObservationBuffer(
+  ObservationBufferWithBase(
     const nav2_util::LifecycleNode::WeakPtr & parent,
     std::string topic_name,
     double observation_keep_time,
@@ -91,7 +91,7 @@ public:
   /**
    * @brief  Destructor... cleans up
    */
-  ~ObservationBuffer();
+  ~ObservationBufferWithBase();
 
   /**
    * @brief  Transforms a PointCloud to the global frame and buffers it
@@ -155,5 +155,5 @@ private:
   tf2::Duration tf_tolerance_;
 };
 }  // namespace nav2_costmap_2d
-#endif  // NAV2_COSTMAP_2D__OBSERVATION_BUFFER_HPP_
+#endif  // NAV2_COSTMAP_2D__OBSERVATION_BUFFER_WITH_BASE_HPP_
 // clang-format on
