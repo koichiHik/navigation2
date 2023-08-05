@@ -1,3 +1,4 @@
+// clang-format off
 /*********************************************************************
  *
  * Software License Agreement (BSD License)
@@ -181,10 +182,13 @@ void Costmap2DPublisher::prepareCostmap()
   }
 }
 
-void Costmap2DPublisher::publishCostmap()
+void Costmap2DPublisher::publishCostmap(const geometry_msgs::msg::PoseStamped &robot_pose)
 {
   if (costmap_raw_pub_->get_subscription_count() > 0) {
     prepareCostmap();
+    if (rclcpp::Time(0, 0, rcl_clock_type_t::RCL_ROS_TIME) != robot_pose.header.stamp) {
+      costmap_raw_->metadata.origin.position.z = robot_pose.pose.position.z;
+    }
     costmap_raw_pub_->publish(std::move(costmap_raw_));
   }
   float resolution = costmap_->getResolution();
@@ -197,6 +201,9 @@ void Costmap2DPublisher::publishCostmap()
   {
     if (costmap_pub_->get_subscription_count() > 0) {
       prepareGrid();
+      if (rclcpp::Time(0, 0, rcl_clock_type_t::RCL_ROS_TIME) != robot_pose.header.stamp) {
+        grid_->info.origin.position.z = robot_pose.pose.position.z;
+      }
       costmap_pub_->publish(std::move(grid_));
     }
   } else if (x0_ < xn_) {
@@ -225,6 +232,12 @@ void Costmap2DPublisher::publishCostmap()
   xn_ = yn_ = 0;
   x0_ = costmap_->getSizeInCellsX();
   y0_ = costmap_->getSizeInCellsY();
+}
+
+void Costmap2DPublisher::publishCostmap()
+{
+  geometry_msgs::msg::PoseStamped pose;
+  publishCostmap(pose);
 }
 
 void
@@ -262,3 +275,4 @@ Costmap2DPublisher::costmap_service_callback(
 }
 
 }  // end namespace nav2_costmap_2d
+// clang-format on

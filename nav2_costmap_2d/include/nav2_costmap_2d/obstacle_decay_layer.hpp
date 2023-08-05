@@ -56,7 +56,7 @@
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "nav2_costmap_2d/costmap_layer.hpp"
 #include "nav2_costmap_2d/layered_costmap.hpp"
-#include "nav2_costmap_2d/observation_buffer.hpp"
+#include "nav2_costmap_2d/observation_buffer_with_base.hpp"
 #include "nav2_costmap_2d/footprint.hpp"
 
 namespace nav2_costmap_2d
@@ -151,7 +151,7 @@ public:
    */
   void laserScanCallback(
     sensor_msgs::msg::LaserScan::ConstSharedPtr message,
-    const std::shared_ptr<nav2_costmap_2d::ObservationBuffer> & buffer);
+    const std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase> & buffer);
 
   /**
    * @brief A callback to handle buffering LaserScan messages which need filtering to turn Inf values into range_max.
@@ -160,7 +160,7 @@ public:
    */
   void laserScanValidInfCallback(
     sensor_msgs::msg::LaserScan::ConstSharedPtr message,
-    const std::shared_ptr<nav2_costmap_2d::ObservationBuffer> & buffer);
+    const std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase> & buffer);
 
   /**
    * @brief  A callback to handle buffering PointCloud2 messages
@@ -169,7 +169,7 @@ public:
    */
   void pointCloud2Callback(
     sensor_msgs::msg::PointCloud2::ConstSharedPtr message,
-    const std::shared_ptr<nav2_costmap_2d::ObservationBuffer> & buffer);
+    const std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase> & buffer);
 
   // for testing purposes
   void addStaticObservation(nav2_costmap_2d::Observation & obs, bool marking, bool clearing);
@@ -226,7 +226,9 @@ protected:
     double * max_x,
     double * max_y);
 
+  rclcpp::Clock::SharedPtr clock_;
   std::string global_frame_;  ///< @brief The global frame for the costmap
+  std::string base_frame_;
   double min_obstacle_height_;  ///< @brief Max Obstacle Height
   double max_obstacle_height_;  ///< @brief Max Obstacle Height
 
@@ -238,11 +240,11 @@ protected:
   /// @brief Used to make sure that transforms are available for each sensor
   std::vector<std::shared_ptr<tf2_ros::MessageFilterBase>> observation_notifiers_;
   /// @brief Used to store observations from various sensors
-  std::vector<std::shared_ptr<nav2_costmap_2d::ObservationBuffer>> observation_buffers_;
+  std::vector<std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase>> observation_buffers_;
   /// @brief Used to store observation buffers used for marking obstacles
-  std::vector<std::shared_ptr<nav2_costmap_2d::ObservationBuffer>> marking_buffers_;
+  std::vector<std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase>> marking_buffers_;
   /// @brief Used to store observation buffers used for clearing obstacles
-  std::vector<std::shared_ptr<nav2_costmap_2d::ObservationBuffer>> clearing_buffers_;
+  std::vector<std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase>> clearing_buffers_;
 
   /// @brief Dynamic parameters handler
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr dyn_params_handler_;

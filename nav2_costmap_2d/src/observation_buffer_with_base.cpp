@@ -54,13 +54,15 @@ ObservationBufferWithBase::ObservationBufferWithBase(
     double obstacle_max_range, double obstacle_min_range,
     double raytrace_max_range, double raytrace_min_range,
     tf2_ros::Buffer& tf2_buffer, std::string global_frame,
-    std::string sensor_frame, tf2::Duration tf_tolerance)
+    std::string base_frame, std::string sensor_frame,
+    tf2::Duration tf_tolerance)
     : tf2_buffer_(tf2_buffer),
       observation_keep_time_(
           rclcpp::Duration::from_seconds(observation_keep_time)),
       expected_update_rate_(
           rclcpp::Duration::from_seconds(expected_update_rate)),
       global_frame_(global_frame),
+      base_frame_(base_frame),
       sensor_frame_(sensor_frame),
       topic_name_(topic_name),
       min_obstacle_height_(min_obstacle_height),
@@ -103,6 +105,19 @@ void ObservationBufferWithBase::bufferCloud(
                           tf_tolerance_);
     tf2::convert(global_origin.point, observation_list_.front().origin_);
 
+    // X. Extract height of base_link in global frame.
+    geometry_msgs::msg::PointStamped base_origin_in_map;
+    {
+      geometry_msgs::msg::PointStamped base_origin;
+      base_origin.header.stamp = cloud.header.stamp;
+      base_origin.header.frame_id = base_frame_;
+      base_origin.point.x = 0;
+      base_origin.point.y = 0;
+      base_origin.point.z = 0;
+      tf2_buffer_.transform(base_origin, base_origin_in_map, global_frame_,
+                            tf_tolerance_);
+    }
+
     // make sure to pass on the raytrace/obstacle range
     // of the observation buffer to the observations
     observation_list_.front().raytrace_max_range_ = raytrace_max_range_;
@@ -142,15 +157,24 @@ void ObservationBufferWithBase::bufferCloud(
         iter_global_end = global_frame_cloud.data.end();
     std::vector<unsigned char>::iterator iter_obs =
         observation_cloud.data.begin();
+
+    // X. Height check is relative to base_link.
     for (; iter_global != iter_global_end;
          ++iter_z, iter_global += global_frame_cloud.point_step) {
-      if ((*iter_z) <= max_obstacle_height_ &&
-          (*iter_z) >= min_obstacle_height_) {
+      if ((*iter_z - base_origin_in_map.point.z) <= max_obstacle_height_ &&
+          min_obstacle_height_ <= (*iter_z - base_origin_in_map.point.z)) {
         std::copy(iter_global, iter_global + global_frame_cloud.point_step,
                   iter_obs);
         iter_obs += global_frame_cloud.point_step;
         ++point_count;
       }
+      // if ((*iter_z) <= max_obstacle_height_ &&
+      //     (*iter_z) >= min_obstacle_height_) {
+      //   std::copy(iter_global, iter_global + global_frame_cloud.point_step,
+      //             iter_obs);
+      //   iter_obs += global_frame_cloud.point_step;
+      //   ++point_count;
+      // }
     }
 
     // resize the cloud for the number of legal points

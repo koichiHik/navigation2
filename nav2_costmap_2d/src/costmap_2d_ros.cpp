@@ -1,3 +1,4 @@
+// clang-format off
 /*********************************************************************
  *
  * Software License Agreement (BSD License)
@@ -453,7 +454,9 @@ void Costmap2DROS::mapUpdateLoop(double frequency) {
                               // switch to sim_time // NOLINT
         {
           RCLCPP_DEBUG(get_logger(), "Publish costmap at %s", name_.c_str());
-          costmap_publisher_->publishCostmap();
+          geometry_msgs::msg::PoseStamped pose;
+          getRobotPose(pose);
+          costmap_publisher_->publishCostmap(pose);
           last_publish_ = current_time;
         }
       }
@@ -707,3 +710,4 @@ Costmap2DROS::dynamicParametersCallback(
 }
 
 }  // namespace nav2_costmap_2d
+// clang-format on

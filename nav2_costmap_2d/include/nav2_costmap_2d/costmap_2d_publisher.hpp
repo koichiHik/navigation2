@@ -1,3 +1,4 @@
+// clang-format off
 /*********************************************************************
  *
  * Software License Agreement (BSD License)
@@ -120,6 +121,11 @@ public:
   /**
    * @brief  Publishes the visualization data over ROS
    */
+  void publishCostmap(const geometry_msgs::msg::PoseStamped &robot_pose);
+
+  /**
+   * @brief  Publishes the visualization data over ROS
+   */
   void publishCostmap();
 
   /**
@@ -179,3 +185,4 @@ private:
 }  // namespace nav2_costmap_2d
 
 #endif  // NAV2_COSTMAP_2D__COSTMAP_2D_PUBLISHER_HPP_
+// clang-format on

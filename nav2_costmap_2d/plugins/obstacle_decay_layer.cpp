@@ -55,7 +55,7 @@ using nav2_costmap_2d::LETHAL_OBSTACLE;
 using nav2_costmap_2d::NO_INFORMATION;
 
 using nav2_costmap_2d::Observation;
-using nav2_costmap_2d::ObservationBuffer;
+using nav2_costmap_2d::ObservationBufferWithBase;
 using rcl_interfaces::msg::ParameterType;
 
 namespace nav2_costmap_2d {
@@ -135,6 +135,8 @@ void ObstacleDecayLayer::onInitialize() {
     bool inf_is_valid, clearing, marking;
 
     declareParameter(source + "." + "topic", rclcpp::ParameterValue(source));
+    declareParameter(source + "." + "base_frame",
+                     rclcpp::ParameterValue(std::string("")));
     declareParameter(source + "." + "sensor_frame",
                      rclcpp::ParameterValue(std::string("")));
     declareParameter(source + "." + "observation_persistence",
@@ -161,6 +163,7 @@ void ObstacleDecayLayer::onInitialize() {
                      rclcpp::ParameterValue(0.0));
 
     node->get_parameter(name_ + "." + source + "." + "topic", topic);
+    node->get_parameter(name_ + "." + source + "." + "base_frame", base_frame_);
     node->get_parameter(name_ + "." + source + "." + "sensor_frame",
                         sensor_frame);
     node->get_parameter(name_ + "." + source + "." + "observation_persistence",
@@ -199,19 +202,19 @@ void ObstacleDecayLayer::onInitialize() {
                         raytrace_min_range);
     node->get_parameter(name_ + "." + source + "." + "raytrace_max_range",
                         raytrace_max_range);
-
+    clock_ = node->get_clock();
     RCLCPP_DEBUG(
         logger_,
         "Creating an observation buffer for source %s, topic %s, frame %s",
         source.c_str(), topic.c_str(), sensor_frame.c_str());
 
     // create an observation buffer
-    observation_buffers_.push_back(
-        std::shared_ptr<ObservationBuffer>(new ObservationBuffer(
+    observation_buffers_.push_back(std::shared_ptr<ObservationBufferWithBase>(
+        new ObservationBufferWithBase(
             node, topic, observation_keep_time, expected_update_rate,
             min_obstacle_height, max_obstacle_height, obstacle_max_range,
             obstacle_min_range, raytrace_max_range, raytrace_min_range, *tf_,
-            global_frame_, sensor_frame,
+            global_frame_, base_frame_, sensor_frame,
             tf2::durationFromSec(transform_tolerance))));
 
     // check if we'll add this buffer to our marking observation buffers
@@ -334,7 +337,7 @@ ObstacleDecayLayer::dynamicParametersCallback(
 
 void ObstacleDecayLayer::laserScanCallback(
     sensor_msgs::msg::LaserScan::ConstSharedPtr message,
-    const std::shared_ptr<nav2_costmap_2d::ObservationBuffer>& buffer) {
+    const std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase>& buffer) {
   // project the laser into a point cloud
   sensor_msgs::msg::PointCloud2 cloud;
   cloud.header = message->header;
@@ -366,7 +369,7 @@ void ObstacleDecayLayer::laserScanCallback(
 
 void ObstacleDecayLayer::laserScanValidInfCallback(
     sensor_msgs::msg::LaserScan::ConstSharedPtr raw_message,
-    const std::shared_ptr<nav2_costmap_2d::ObservationBuffer>& buffer) {
+    const std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase>& buffer) {
   // Filter positive infinities ("Inf"s) to max_range.
   float epsilon = 0.0001;  // a tenth of a millimeter
   sensor_msgs::msg::LaserScan message = *raw_message;
@@ -408,7 +411,7 @@ void ObstacleDecayLayer::laserScanValidInfCallback(
 
 void ObstacleDecayLayer::pointCloud2Callback(
     sensor_msgs::msg::PointCloud2::ConstSharedPtr message,
-    const std::shared_ptr<ObservationBuffer>& buffer) {
+    const std::shared_ptr<ObservationBufferWithBase>& buffer) {
   // buffer the point cloud
   buffer->lock();
   buffer->bufferCloud(*message);
@@ -460,6 +463,20 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
     }
   }
 
+  // X. Extract height of base_link
+  geometry_msgs::msg::PointStamped base_origin_in_map;
+  {
+    geometry_msgs::msg::PointStamped base_origin;
+    base_origin.header.stamp = clock_->now();
+    base_origin.header.frame_id = base_frame_;
+    base_origin.point.x = 0;
+    base_origin.point.y = 0;
+    base_origin.point.z = 0;
+    const double TF_DURATION_SEC = 1.0;
+    tf_->transform(base_origin, base_origin_in_map, global_frame_,
+                   tf2::durationFromSec(TF_DURATION_SEC));
+  }
+
   // place the new obstacles into a priority queue... each with a priority of
   // zero to begin with
   for (std::vector<Observation>::const_iterator it = observations.begin();
@@ -481,14 +498,14 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
       double px = *iter_x, py = *iter_y, pz = *iter_z;
 
       // if the obstacle is too low, we won't add it
-      if (pz < min_obstacle_height_) {
+      if ((pz - base_origin_in_map.point.z) < min_obstacle_height_) {
         RCLCPP_DEBUG(logger_, "The point is too low");
         continue;
       }
 
       // if the obstacle is too high or too far away from the robot we won't add
       // it
-      if (pz > max_obstacle_height_) {
+      if ((pz - base_origin_in_map.point.z) > max_obstacle_height_) {
         RCLCPP_DEBUG(logger_, "The point is too high");
         continue;
       }
