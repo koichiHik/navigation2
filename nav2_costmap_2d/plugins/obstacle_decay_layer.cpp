@@ -442,8 +442,22 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
   current_ = current;
 
   // raytrace freespace
-  for (unsigned int i = 0; i < clearing_observations.size(); ++i) {
-    raytraceFreespace(clearing_observations[i], min_x, min_y, max_x, max_y);
+  // for (unsigned int i = 0; i < clearing_observations.size(); ++i) {
+  //   raytraceFreespace(clearing_observations[i], min_x, min_y, max_x, max_y);
+  // }
+
+  // X. Set bounds.
+  *min_x = robot_x - getSizeInMetersX();
+  *min_y = robot_y - getSizeInMetersY();
+  *max_x = robot_x + getSizeInMetersX();
+  *max_y = robot_y + getSizeInMetersY();
+
+  // X. Reset to free space every time.
+  for (unsigned int x = 0; x < size_x_; x++) {
+    for (unsigned int y = 0; y < size_y_; y++) {
+      unsigned int index = getIndex(x, y);
+      costmap_[index] = nav2_costmap_2d::FREE_SPACE;
+    }
   }
 
   // place the new obstacles into a priority queue... each with a priority of
