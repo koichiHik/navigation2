@@ -226,9 +226,7 @@ protected:
     double * max_x,
     double * max_y);
 
-  rclcpp::Clock::SharedPtr clock_;
   std::string global_frame_;  ///< @brief The global frame for the costmap
-  std::string base_frame_;
   double min_obstacle_height_;  ///< @brief Max Obstacle Height
   double max_obstacle_height_;  ///< @brief Max Obstacle Height
 

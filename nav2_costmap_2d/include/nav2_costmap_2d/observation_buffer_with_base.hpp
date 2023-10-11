@@ -73,7 +73,6 @@ public:
    * @param  raytrace_min_range The range from which the sensor should be trusted for raytracing to clear out space
    * @param  tf2_buffer A reference to a tf2 Buffer
    * @param  global_frame The frame to transform PointClouds into
-   * @param  base_frame   The frame of the robot base.
    * @param  sensor_frame The frame of the origin of the sensor, can be left blank to be read from the messages
    * @param  tf_tolerance The amount of time to wait for a transform to be available when setting a new global frame
    */
@@ -86,7 +85,6 @@ public:
     double obstacle_min_range,
     double raytrace_max_range, double raytrace_min_range, tf2_ros::Buffer & tf2_buffer,
     std::string global_frame,
-    std::string base_frame,
     std::string sensor_frame,
     tf2::Duration tf_tolerance);
 
@@ -148,7 +146,6 @@ private:
   const rclcpp::Duration expected_update_rate_;
   rclcpp::Time last_updated_;
   std::string global_frame_;
-  std::string base_frame_;
   std::string sensor_frame_;
   std::list<Observation> observation_list_;
   std::string topic_name_;
