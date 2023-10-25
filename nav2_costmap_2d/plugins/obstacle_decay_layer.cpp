@@ -81,6 +81,7 @@ void ObstacleDecayLayer::onInitialize() {
   declareParameter("combination_method", rclcpp::ParameterValue(1));
   declareParameter("observation_sources",
                    rclcpp::ParameterValue(std::string("")));
+  declareParameter("obstacle_pointcount", rclcpp::ParameterValue(1));
 
   auto node = node_.lock();
   if (!node) {
@@ -98,6 +99,8 @@ void ObstacleDecayLayer::onInitialize() {
   node->get_parameter("track_unknown_space", track_unknown_space);
   node->get_parameter("transform_tolerance", transform_tolerance);
   node->get_parameter(name_ + "." + "observation_sources", topics_string);
+  node->get_parameter(name_ + "." + "obstacle_pointcount",
+                      obstacle_pointcount_);
 
   dyn_params_handler_ = node->add_on_set_parameters_callback(
       std::bind(&ObstacleDecayLayer::dynamicParametersCallback, this,
@@ -456,6 +459,7 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
   for (unsigned int x = 0; x < size_x_; x++) {
     for (unsigned int y = 0; y < size_y_; y++) {
       unsigned int index = getIndex(x, y);
+      tmp_costmap_.at(index) = Grid();
       costmap_[index] = nav2_costmap_2d::FREE_SPACE;
     }
   }
@@ -518,9 +522,27 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
         continue;
       }
 
+      // unsigned int index = getIndex(mx, my);
+      // costmap_[index] = LETHAL_OBSTACLE;
+      // touch(px, py, min_x, min_y, max_x, max_y);
+
       unsigned int index = getIndex(mx, my);
-      costmap_[index] = LETHAL_OBSTACLE;
-      touch(px, py, min_x, min_y, max_x, max_y);
+      Grid& grid = tmp_costmap_.at(index);
+      ++grid.count_;
+      touch(px, py, &grid.min_x_, &grid.min_y_, &grid.max_x_, &grid.max_y_);
+    }
+  }
+
+  // X. Copy temporary buffer.
+  for (size_t idx_x = 0; idx_x < size_x_; ++idx_x) {
+    for (size_t idx_y = 0; idx_y < size_y_; ++idx_y) {
+      unsigned int index = getIndex(idx_x, idx_y);
+      const Grid& grid = tmp_costmap_.at(index);
+      if (obstacle_pointcount_ <= grid.count_) {
+        costmap_[index] = LETHAL_OBSTACLE;
+        touch(grid.min_x_, grid.min_y_, min_x, min_y, max_x, max_y);
+        touch(grid.max_x_, grid.max_y_, min_x, min_y, max_x, max_y);
+      }
     }
   }
 
@@ -719,6 +741,9 @@ void ObstacleDecayLayer::activate() {
     notifier->clear();
   }
 
+  // X. Temporary buffer
+  tmp_costmap_.resize(size_x_ * size_y_, Grid());
+
   // if we're stopped we need to re-subscribe to topics
   for (unsigned int i = 0; i < observation_subscribers_.size(); ++i) {
     if (observation_subscribers_[i] != NULL) {
@@ -734,6 +759,9 @@ void ObstacleDecayLayer::deactivate() {
       observation_subscribers_[i]->unsubscribe();
     }
   }
+
+  // X. Clear temporary buffer.
+  tmp_costmap_.clear();
 }
 
 void ObstacleDecayLayer::updateRaytraceBounds(double ox, double oy, double wx,

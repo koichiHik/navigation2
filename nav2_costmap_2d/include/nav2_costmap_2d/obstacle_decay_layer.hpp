@@ -229,6 +229,7 @@ protected:
   std::string global_frame_;  ///< @brief The global frame for the costmap
   double min_obstacle_height_;  ///< @brief Max Obstacle Height
   double max_obstacle_height_;  ///< @brief Max Obstacle Height
+  int obstacle_pointcount_;
 
   /// @brief Used to project laser scans into point clouds
   laser_geometry::LaserProjection projector_;
@@ -254,6 +255,23 @@ protected:
   bool rolling_window_;
   bool was_reset_;
   int combination_method_;
+
+private:
+  struct Grid {
+    Grid() : 
+      min_x_(0.0), 
+      min_y_(0.0),
+      max_x_(0.0),
+      max_y_(0.0),
+      count_(0) {}
+    double min_x_;
+    double min_y_;
+    double max_x_;
+    double max_y_;
+    int count_;
+  };
+
+  std::vector<Grid> tmp_costmap_;
 };
 
 }  // namespace nav2_costmap_2d
