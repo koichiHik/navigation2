@@ -127,6 +127,8 @@ public:
    */
   virtual void reset();
 
+  bool isCurrent() const override;
+
   /**
    * @brief If clearing operations should be processed on this layer or not
    */
@@ -176,13 +178,20 @@ public:
   void clearStaticObservations(bool marking, bool clearing);
 
 protected:
+  struct BufferedFreshness
+  {
+    std::shared_ptr<ObservationBufferWithBase> buffer;
+    ObservationBufferWithBase::Freshness observation;
+  };
+
   /**
    * @brief  Get the observations used to mark space
    * @param marking_observations A reference to a vector that will be populated with the observations
    * @return True if all the observation buffers are current, false otherwise
    */
   bool getMarkingObservations(
-    std::vector<nav2_costmap_2d::Observation> & marking_observations) const;
+    std::vector<nav2_costmap_2d::Observation> & marking_observations,
+    std::vector<BufferedFreshness> * snapshots = nullptr) const;
 
   /**
    * @brief  Get the observations used to clear space
@@ -190,7 +199,8 @@ protected:
    * @return True if all the observation buffers are current, false otherwise
    */
   bool getClearingObservations(
-    std::vector<nav2_costmap_2d::Observation> & clearing_observations) const;
+    std::vector<nav2_costmap_2d::Observation> & clearing_observations,
+    std::vector<BufferedFreshness> * snapshots = nullptr) const;
 
   /**
    * @brief  Clear freespace based on one observation
@@ -253,7 +263,9 @@ protected:
   std::vector<nav2_costmap_2d::Observation> static_marking_observations_;
 
   bool rolling_window_;
-  bool was_reset_;
+  bool update_pending_ = false;
+  std::vector<BufferedFreshness> pending_observations_;
+  std::vector<BufferedFreshness> applied_observations_;
   int combination_method_;
 
 private:

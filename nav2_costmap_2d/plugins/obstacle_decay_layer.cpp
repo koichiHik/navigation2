@@ -117,8 +117,7 @@ void ObstacleDecayLayer::onInitialize() {
   }
 
   ObstacleDecayLayer::matchSize();
-  current_ = true;
-  was_reset_ = false;
+  current_ = false;
 
   global_frame_ = layered_costmap_->getGlobalFrameID();
 
@@ -132,7 +131,7 @@ void ObstacleDecayLayer::onInitialize() {
   std::string source;
   while (ss >> source) {
     // get the parameters for the specific topic
-    double observation_keep_time, expected_update_rate, min_obstacle_height,
+    double observation_keep_time, expected_update_rate, max_observation_age, min_obstacle_height,
         max_obstacle_height;
     std::string topic, sensor_frame, data_type;
     bool inf_is_valid, clearing, marking;
@@ -143,6 +142,8 @@ void ObstacleDecayLayer::onInitialize() {
     declareParameter(source + "." + "observation_persistence",
                      rclcpp::ParameterValue(0.0));
     declareParameter(source + "." + "expected_update_rate",
+                     rclcpp::ParameterValue(0.0));
+    declareParameter(source + "." + "max_observation_age",
                      rclcpp::ParameterValue(0.0));
     declareParameter(source + "." + "data_type",
                      rclcpp::ParameterValue(std::string("LaserScan")));
@@ -170,6 +171,8 @@ void ObstacleDecayLayer::onInitialize() {
                         observation_keep_time);
     node->get_parameter(name_ + "." + source + "." + "expected_update_rate",
                         expected_update_rate);
+    node->get_parameter(name_ + "." + source + "." + "max_observation_age",
+                        max_observation_age);
     node->get_parameter(name_ + "." + source + "." + "data_type", data_type);
     node->get_parameter(name_ + "." + source + "." + "min_obstacle_height",
                         min_obstacle_height);
@@ -215,7 +218,7 @@ void ObstacleDecayLayer::onInitialize() {
             min_obstacle_height, max_obstacle_height, obstacle_max_range,
             obstacle_min_range, raytrace_max_range, raytrace_min_range, *tf_,
             global_frame_, sensor_frame,
-            tf2::durationFromSec(transform_tolerance))));
+            tf2::durationFromSec(transform_tolerance), max_observation_age)));
 
     // check if we'll add this buffer to our marking observation buffers
     if (marking) {
@@ -358,6 +361,7 @@ void ObstacleDecayLayer::laserScanCallback(
                 "from laser is malformed."
                 " Ignore this message. what(): %s",
                 ex.what());
+    buffer->invalidate();
     return;
   }
 
@@ -400,6 +404,7 @@ void ObstacleDecayLayer::laserScanValidInfCallback(
                 "from laser is malformed."
                 " Ignore this message. what(): %s",
                 ex.what());
+    buffer->invalidate();
     return;
   }
 
@@ -432,30 +437,26 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
   }
   useExtraBounds(min_x, min_y, max_x, max_y);
 
-  bool current = true;
+  current_ = false;
+  update_pending_ = false;
+  pending_observations_.clear();
   std::vector<Observation> observations, clearing_observations;
+  const bool marking_current = getMarkingObservations(observations, &pending_observations_);
+  const bool clearing_current = getClearingObservations(clearing_observations, &pending_observations_);
 
-  // get the marking observations
-  current = current && getMarkingObservations(observations);
-
-  // get the clearing observations
-  current = current && getClearingObservations(clearing_observations);
-
-  // update the global current status
-  current_ = current;
-
-  // raytrace freespace
-  // for (unsigned int i = 0; i < clearing_observations.size(); ++i) {
-  //   raytraceFreespace(clearing_observations[i], min_x, min_y, max_x, max_y);
-  // }
-
-  // X. Set bounds.
+  // Always merge the retained grid, including while observations are unavailable.
   *min_x = robot_x - getSizeInMetersX();
   *min_y = robot_y - getSizeInMetersY();
   *max_x = robot_x + getSizeInMetersX();
   *max_y = robot_y + getSizeInMetersY();
+  if (!marking_current || !clearing_current || observations.empty()) {
+    return;
+  }
+  tmp_costmap_.resize(size_x_ * size_y_);
 
-  // X. Reset to free space every time.
+  // A successful snapshot replaces the previous grid. An empty *cloud* is a
+  // valid observation; an empty observation list is not evidence of free space.
+  // Rebuild from the retained latest snapshot (observation_persistence == 0).
   for (unsigned int x = 0; x < size_x_; x++) {
     for (unsigned int y = 0; y < size_y_; y++) {
       unsigned int index = getIndex(x, y);
@@ -547,6 +548,7 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
   }
 
   updateFootprint(robot_x, robot_y, robot_yaw, min_x, min_y, max_x, max_y);
+  update_pending_ = true;
 }
 
 void ObstacleDecayLayer::updateFootprint(double robot_x, double robot_y,
@@ -573,13 +575,7 @@ void ObstacleDecayLayer::updateCosts(nav2_costmap_2d::Costmap2D& master_grid,
     return;
   }
 
-  // if not current due to reset, set current now after clearing
-  if (!current_ && was_reset_) {
-    was_reset_ = false;
-    current_ = true;
-  }
-
-  if (footprint_clearing_enabled_) {
+  if (update_pending_ && footprint_clearing_enabled_) {
     setConvexPolygonCost(transformed_footprint_, nav2_costmap_2d::FREE_SPACE);
   }
 
@@ -591,8 +587,27 @@ void ObstacleDecayLayer::updateCosts(nav2_costmap_2d::Costmap2D& master_grid,
       updateWithMax(master_grid, min_i, min_j, max_i, max_j);
       break;
     default:  // Nothing
-      break;
+      current_ = false;
+      return;
   }
+  if (update_pending_) {
+    applied_observations_ = pending_observations_;
+    update_pending_ = false;
+    current_ = true;
+  }
+}
+
+bool ObstacleDecayLayer::isCurrent() const {
+  std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
+  if (!current_) {
+    return false;
+  }
+  for (const auto & snapshot : applied_observations_) {
+    if (!snapshot.buffer->isCurrent(snapshot.observation)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void ObstacleDecayLayer::addStaticObservation(nav2_costmap_2d::Observation& obs,
@@ -615,12 +630,17 @@ void ObstacleDecayLayer::clearStaticObservations(bool marking, bool clearing) {
 }
 
 bool ObstacleDecayLayer::getMarkingObservations(
-    std::vector<Observation>& marking_observations) const {
+    std::vector<Observation>& marking_observations,
+    std::vector<BufferedFreshness> * snapshots) const {
   bool current = true;
   // get the marking observations
   for (unsigned int i = 0; i < marking_buffers_.size(); ++i) {
     marking_buffers_[i]->lock();
-    marking_buffers_[i]->getObservations(marking_observations);
+    ObservationBufferWithBase::Freshness observation;
+    marking_buffers_[i]->getObservations(marking_observations, &observation);
+    if (snapshots) {
+      snapshots->push_back({marking_buffers_[i], observation});
+    }
     current = marking_buffers_[i]->isCurrent() && current;
     marking_buffers_[i]->unlock();
   }
@@ -631,12 +651,17 @@ bool ObstacleDecayLayer::getMarkingObservations(
 }
 
 bool ObstacleDecayLayer::getClearingObservations(
-    std::vector<Observation>& clearing_observations) const {
+    std::vector<Observation>& clearing_observations,
+    std::vector<BufferedFreshness> * snapshots) const {
   bool current = true;
   // get the clearing observations
   for (unsigned int i = 0; i < clearing_buffers_.size(); ++i) {
     clearing_buffers_[i]->lock();
-    clearing_buffers_[i]->getObservations(clearing_observations);
+    ObservationBufferWithBase::Freshness observation;
+    clearing_buffers_[i]->getObservations(clearing_observations, &observation);
+    if (snapshots) {
+      snapshots->push_back({clearing_buffers_[i], observation});
+    }
     current = clearing_buffers_[i]->isCurrent() && current;
     clearing_buffers_[i]->unlock();
   }
@@ -737,6 +762,11 @@ void ObstacleDecayLayer::raytraceFreespace(
 }
 
 void ObstacleDecayLayer::activate() {
+  std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
+  current_ = false;
+  applied_observations_.clear();
+  pending_observations_.clear();
+  update_pending_ = false;
   for (auto& notifier : observation_notifiers_) {
     notifier->clear();
   }
@@ -754,6 +784,8 @@ void ObstacleDecayLayer::activate() {
 }
 
 void ObstacleDecayLayer::deactivate() {
+  std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
+  current_ = false;
   for (unsigned int i = 0; i < observation_subscribers_.size(); ++i) {
     if (observation_subscribers_[i] != NULL) {
       observation_subscribers_[i]->unsubscribe();
@@ -780,10 +812,13 @@ void ObstacleDecayLayer::updateRaytraceBounds(double ox, double oy, double wx,
 }
 
 void ObstacleDecayLayer::reset() {
+  std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   resetMaps();
   resetBuffersLastUpdated();
   current_ = false;
-  was_reset_ = true;
+  update_pending_ = false;
+  applied_observations_.clear();
+  pending_observations_.clear();
 }
 
 void ObstacleDecayLayer::resetBuffersLastUpdated() {

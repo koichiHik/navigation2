@@ -134,7 +134,7 @@ public:
    *        variable current_.
    * @return Whether the data in the layer is up to date.
    */
-  bool isCurrent() const
+  virtual bool isCurrent() const
   {
     return current_;
   }

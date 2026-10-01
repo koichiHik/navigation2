@@ -364,6 +364,10 @@ public:
   {
     return access_;
   }
+  mutex_t * getMutex() const
+  {
+    return access_;
+  }
 
 protected:
   /**

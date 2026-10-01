@@ -38,6 +38,7 @@
 #ifndef NAV2_COSTMAP_2D__OBSERVATION_BUFFER_WITH_BASE_HPP_
 #define NAV2_COSTMAP_2D__OBSERVATION_BUFFER_WITH_BASE_HPP_
 
+#include <cstdint>
 #include <vector>
 #include <list>
 #include <string>
@@ -75,6 +76,7 @@ public:
    * @param  global_frame The frame to transform PointClouds into
    * @param  sensor_frame The frame of the origin of the sensor, can be left blank to be read from the messages
    * @param  tf_tolerance The amount of time to wait for a transform to be available when setting a new global frame
+   * @param  max_observation_age Capture-age limit in seconds; 0 disables this limit
    */
   ObservationBufferWithBase(
     const nav2_util::LifecycleNode::WeakPtr & parent,
@@ -86,7 +88,7 @@ public:
     double raytrace_max_range, double raytrace_min_range, tf2_ros::Buffer & tf2_buffer,
     std::string global_frame,
     std::string sensor_frame,
-    tf2::Duration tf_tolerance);
+    tf2::Duration tf_tolerance, double max_observation_age = 0.0);
 
   /**
    * @brief  Destructor... cleans up
@@ -104,13 +106,28 @@ public:
    * @brief  Pushes copies of all current observations onto the end of the vector passed in
    * @param  observations The vector to be filled
    */
-  void getObservations(std::vector<Observation> & observations);
+  struct Freshness
+  {
+    int64_t capture_ns = 0;
+    int64_t received_ns = 0;
+    bool valid = false;
+    uint64_t generation = 0;
+  };
+
+  void getObservations(
+    std::vector<Observation> & observations, Freshness * freshness = nullptr);
 
   /**
    * @brief  Check if the observation buffer is being update at its expected rate
    * @return True if it is being updated at the expected rate, false otherwise
    */
   bool isCurrent() const;
+
+  // Evaluate the observation actually applied to the grid, not a newer arrival.
+  bool isCurrent(const Freshness & applied) const;
+
+  // Keep the last successful observation, but make it unavailable after an error.
+  void invalidate();
 
   /**
    * @brief  Lock the observation buffer
@@ -129,7 +146,7 @@ public:
   }
 
   /**
-   * @brief Reset last updated timestamp
+   * @brief Clear observations and require new input after reset/activation
    */
   void resetLastUpdated();
 
@@ -144,13 +161,16 @@ private:
   tf2_ros::Buffer & tf2_buffer_;
   const rclcpp::Duration observation_keep_time_;
   const rclcpp::Duration expected_update_rate_;
-  rclcpp::Time last_updated_;
+  const rclcpp::Duration max_observation_age_;
+  Freshness latest_;
+  bool input_valid_ = false;
+  uint64_t generation_ = 0;
   std::string global_frame_;
   std::string sensor_frame_;
   std::list<Observation> observation_list_;
   std::string topic_name_;
   double min_obstacle_height_, max_obstacle_height_;
-  std::recursive_mutex lock_;  ///< @brief A lock for accessing data in callbacks safely
+  mutable std::recursive_mutex lock_;  ///< @brief A lock for accessing data in callbacks safely
   double obstacle_max_range_, obstacle_min_range_, raytrace_max_range_, raytrace_min_range_;
   tf2::Duration tf_tolerance_;
 };

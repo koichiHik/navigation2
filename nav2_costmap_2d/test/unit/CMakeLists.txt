@@ -55,3 +55,8 @@ ament_add_gtest(denoise_layer_test denoise_layer_test.cpp image_test.cpp image_p
 target_link_libraries(denoise_layer_test
   nav2_costmap_2d_core layers
 )
+
+ament_add_gtest(obstacle_decay_freshness_test obstacle_decay_freshness_test.cpp)
+target_link_libraries(obstacle_decay_freshness_test
+  nav2_costmap_2d_core layers
+)
