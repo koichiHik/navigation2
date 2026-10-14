@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.5)
 project(nav2_costmap_2d)
 
 find_package(ament_cmake REQUIRED)
+find_package(camera_localization_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(laser_geometry REQUIRED)
 find_package(map_msgs REQUIRED)
@@ -53,8 +54,8 @@ add_library(nav2_costmap_2d_core SHARED
   src/footprint_collision_checker.cpp
   plugins/costmap_filters/costmap_filter.cpp
 )
-
 set(dependencies
+  camera_localization_msgs
   geometry_msgs
   laser_geometry
   map_msgs
@@ -86,6 +87,8 @@ add_library(layers SHARED
   plugins/static_layer.cpp
   plugins/obstacle_layer.cpp
   plugins/obstacle_decay_layer.cpp
+  plugins/obstacle_decay_snapshot.cpp
+  src/temporal_obstacle_evidence.cpp
   src/observation_buffer.cpp
   src/observation_buffer_with_base.cpp
   plugins/voxel_layer.cpp

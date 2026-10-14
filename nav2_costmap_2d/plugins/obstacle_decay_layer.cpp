@@ -39,7 +39,9 @@
 #include "nav2_costmap_2d/obstacle_decay_layer.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -47,8 +49,7 @@
 #include "pluginlib/class_list_macros.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 
-PLUGINLIB_EXPORT_CLASS(nav2_costmap_2d::ObstacleDecayLayer,
-                       nav2_costmap_2d::Layer)
+PLUGINLIB_EXPORT_CLASS(nav2_costmap_2d::ObstacleDecayLayer, nav2_costmap_2d::Layer)
 
 using nav2_costmap_2d::FREE_SPACE;
 using nav2_costmap_2d::LETHAL_OBSTACLE;
@@ -58,16 +59,19 @@ using nav2_costmap_2d::Observation;
 using nav2_costmap_2d::ObservationBufferWithBase;
 using rcl_interfaces::msg::ParameterType;
 
-namespace nav2_costmap_2d {
+namespace nav2_costmap_2d
+{
 
-ObstacleDecayLayer::~ObstacleDecayLayer() {
+ObstacleDecayLayer::~ObstacleDecayLayer()
+{
   dyn_params_handler_.reset();
-  for (auto& notifier : observation_notifiers_) {
+  for (auto & notifier : observation_notifiers_) {
     notifier.reset();
   }
 }
 
-void ObstacleDecayLayer::onInitialize() {
+void ObstacleDecayLayer::onInitialize()
+{
   bool track_unknown_space;
   double transform_tolerance;
 
@@ -79,8 +83,7 @@ void ObstacleDecayLayer::onInitialize() {
   declareParameter("min_obstacle_height", rclcpp::ParameterValue(0.0));
   declareParameter("max_obstacle_height", rclcpp::ParameterValue(2.0));
   declareParameter("combination_method", rclcpp::ParameterValue(1));
-  declareParameter("observation_sources",
-                   rclcpp::ParameterValue(std::string("")));
+  declareParameter("observation_sources", rclcpp::ParameterValue(std::string("")));
   declareParameter("obstacle_pointcount", rclcpp::ParameterValue(1));
 
   auto node = node_.lock();
@@ -89,22 +92,25 @@ void ObstacleDecayLayer::onInitialize() {
   }
 
   node->get_parameter(name_ + "." + "enabled", enabled_);
-  node->get_parameter(name_ + "." + "footprint_clearing_enabled",
-                      footprint_clearing_enabled_);
-  node->get_parameter(name_ + "." + "min_obstacle_height",
-                      min_obstacle_height_);
-  node->get_parameter(name_ + "." + "max_obstacle_height",
-                      max_obstacle_height_);
+  node->get_parameter(name_ + "." + "footprint_clearing_enabled", footprint_clearing_enabled_);
+  node->get_parameter(name_ + "." + "min_obstacle_height", min_obstacle_height_);
+  node->get_parameter(name_ + "." + "max_obstacle_height", max_obstacle_height_);
   node->get_parameter(name_ + "." + "combination_method", combination_method_);
   node->get_parameter("track_unknown_space", track_unknown_space);
   node->get_parameter("transform_tolerance", transform_tolerance);
   node->get_parameter(name_ + "." + "observation_sources", topics_string);
-  node->get_parameter(name_ + "." + "obstacle_pointcount",
-                      obstacle_pointcount_);
+  node->get_parameter(name_ + "." + "obstacle_pointcount", obstacle_pointcount_);
 
-  dyn_params_handler_ = node->add_on_set_parameters_callback(
-      std::bind(&ObstacleDecayLayer::dynamicParametersCallback, this,
-                std::placeholders::_1));
+  if (!std::isfinite(min_obstacle_height_) || !std::isfinite(max_obstacle_height_) ||
+    min_obstacle_height_ > max_obstacle_height_)
+  {
+    throw std::invalid_argument(
+            "obstacle height limits must be finite and min_obstacle_height must not exceed "
+            "max_obstacle_height");
+  }
+  if (combination_method_ != 0 && combination_method_ != 1) {
+    throw std::invalid_argument("combination_method must be 0 (overwrite) or 1 (maximum)");
+  }
 
   RCLCPP_INFO(logger_, "Subscribed to Topics: %s", topics_string.c_str());
 
@@ -124,6 +130,18 @@ void ObstacleDecayLayer::onInitialize() {
   auto sub_opt = rclcpp::SubscriptionOptions();
   sub_opt.callback_group = callback_group_;
 
+  const bool snapshot_input_initialized = initializeSnapshotInput(topics_string);
+  // Register dynamic callbacks only after every startup-only snapshot parameter
+  // has consumed its launch override. Otherwise parameter declaration itself
+  // would be mistaken for an unsafe runtime policy change.
+  dyn_params_handler_ = node->add_on_set_parameters_callback(
+    std::bind(&ObstacleDecayLayer::dynamicParametersCallback, this, std::placeholders::_1));
+  if (snapshot_input_initialized) {
+    default_value_ = unreported_cells_are_free_ ? FREE_SPACE : NO_INFORMATION;
+    resetMaps();
+    return;
+  }
+
   // now we need to split the topics based on whitespace which we can use a
   // stringstream for
   std::stringstream ss(topics_string);
@@ -132,93 +150,72 @@ void ObstacleDecayLayer::onInitialize() {
   while (ss >> source) {
     // get the parameters for the specific topic
     double observation_keep_time, expected_update_rate, max_observation_age, min_obstacle_height,
-        max_obstacle_height;
+      max_obstacle_height;
     std::string topic, sensor_frame, data_type;
     bool inf_is_valid, clearing, marking;
 
     declareParameter(source + "." + "topic", rclcpp::ParameterValue(source));
-    declareParameter(source + "." + "sensor_frame",
-                     rclcpp::ParameterValue(std::string("")));
-    declareParameter(source + "." + "observation_persistence",
-                     rclcpp::ParameterValue(0.0));
-    declareParameter(source + "." + "expected_update_rate",
-                     rclcpp::ParameterValue(0.0));
-    declareParameter(source + "." + "max_observation_age",
-                     rclcpp::ParameterValue(0.0));
-    declareParameter(source + "." + "data_type",
-                     rclcpp::ParameterValue(std::string("LaserScan")));
-    declareParameter(source + "." + "min_obstacle_height",
-                     rclcpp::ParameterValue(0.0));
-    declareParameter(source + "." + "max_obstacle_height",
-                     rclcpp::ParameterValue(0.0));
-    declareParameter(source + "." + "inf_is_valid",
-                     rclcpp::ParameterValue(false));
+    declareParameter(source + "." + "sensor_frame", rclcpp::ParameterValue(std::string("")));
+    declareParameter(source + "." + "observation_persistence", rclcpp::ParameterValue(0.0));
+    declareParameter(source + "." + "expected_update_rate", rclcpp::ParameterValue(0.0));
+    declareParameter(source + "." + "max_observation_age", rclcpp::ParameterValue(0.0));
+    declareParameter(source + "." + "data_type", rclcpp::ParameterValue(std::string("LaserScan")));
+    declareParameter(source + "." + "min_obstacle_height", rclcpp::ParameterValue(0.0));
+    declareParameter(source + "." + "max_obstacle_height", rclcpp::ParameterValue(0.0));
+    declareParameter(source + "." + "inf_is_valid", rclcpp::ParameterValue(false));
     declareParameter(source + "." + "marking", rclcpp::ParameterValue(true));
     declareParameter(source + "." + "clearing", rclcpp::ParameterValue(false));
-    declareParameter(source + "." + "obstacle_max_range",
-                     rclcpp::ParameterValue(2.5));
-    declareParameter(source + "." + "obstacle_min_range",
-                     rclcpp::ParameterValue(0.0));
-    declareParameter(source + "." + "raytrace_max_range",
-                     rclcpp::ParameterValue(3.0));
-    declareParameter(source + "." + "raytrace_min_range",
-                     rclcpp::ParameterValue(0.0));
+    declareParameter(source + "." + "obstacle_max_range", rclcpp::ParameterValue(2.5));
+    declareParameter(source + "." + "obstacle_min_range", rclcpp::ParameterValue(0.0));
+    declareParameter(source + "." + "raytrace_max_range", rclcpp::ParameterValue(3.0));
+    declareParameter(source + "." + "raytrace_min_range", rclcpp::ParameterValue(0.0));
 
     node->get_parameter(name_ + "." + source + "." + "topic", topic);
-    node->get_parameter(name_ + "." + source + "." + "sensor_frame",
-                        sensor_frame);
-    node->get_parameter(name_ + "." + source + "." + "observation_persistence",
-                        observation_keep_time);
-    node->get_parameter(name_ + "." + source + "." + "expected_update_rate",
-                        expected_update_rate);
-    node->get_parameter(name_ + "." + source + "." + "max_observation_age",
-                        max_observation_age);
+    node->get_parameter(name_ + "." + source + "." + "sensor_frame", sensor_frame);
+    node->get_parameter(
+      name_ + "." + source + "." + "observation_persistence",
+      observation_keep_time);
+    node->get_parameter(name_ + "." + source + "." + "expected_update_rate", expected_update_rate);
+    node->get_parameter(name_ + "." + source + "." + "max_observation_age", max_observation_age);
     node->get_parameter(name_ + "." + source + "." + "data_type", data_type);
-    node->get_parameter(name_ + "." + source + "." + "min_obstacle_height",
-                        min_obstacle_height);
-    node->get_parameter(name_ + "." + source + "." + "max_obstacle_height",
-                        max_obstacle_height);
-    node->get_parameter(name_ + "." + source + "." + "inf_is_valid",
-                        inf_is_valid);
+    node->get_parameter(name_ + "." + source + "." + "min_obstacle_height", min_obstacle_height);
+    node->get_parameter(name_ + "." + source + "." + "max_obstacle_height", max_obstacle_height);
+    node->get_parameter(name_ + "." + source + "." + "inf_is_valid", inf_is_valid);
     node->get_parameter(name_ + "." + source + "." + "marking", marking);
     node->get_parameter(name_ + "." + source + "." + "clearing", clearing);
 
     if (!(data_type == "PointCloud2" || data_type == "LaserScan")) {
-      RCLCPP_FATAL(logger_,
-                   "Only topics that use point cloud2s or laser scans are "
-                   "currently supported");
+      RCLCPP_FATAL(
+        logger_,
+        "Only topics that use point cloud2s or laser scans are "
+        "currently supported");
       throw std::runtime_error(
-          "Only topics that use point cloud2s or laser scans are currently "
-          "supported");
+              "Only topics that use point cloud2s or laser scans are currently "
+              "supported");
     }
 
     // get the obstacle range for the sensor
     double obstacle_max_range, obstacle_min_range;
-    node->get_parameter(name_ + "." + source + "." + "obstacle_max_range",
-                        obstacle_max_range);
-    node->get_parameter(name_ + "." + source + "." + "obstacle_min_range",
-                        obstacle_min_range);
+    node->get_parameter(name_ + "." + source + "." + "obstacle_max_range", obstacle_max_range);
+    node->get_parameter(name_ + "." + source + "." + "obstacle_min_range", obstacle_min_range);
 
     // get the raytrace ranges for the sensor
     double raytrace_max_range, raytrace_min_range;
-    node->get_parameter(name_ + "." + source + "." + "raytrace_min_range",
-                        raytrace_min_range);
-    node->get_parameter(name_ + "." + source + "." + "raytrace_max_range",
-                        raytrace_max_range);
+    node->get_parameter(name_ + "." + source + "." + "raytrace_min_range", raytrace_min_range);
+    node->get_parameter(name_ + "." + source + "." + "raytrace_max_range", raytrace_max_range);
 
     RCLCPP_DEBUG(
-        logger_,
-        "Creating an observation buffer for source %s, topic %s, frame %s",
-        source.c_str(), topic.c_str(), sensor_frame.c_str());
+      logger_, "Creating an observation buffer for source %s, topic %s, frame %s",
+      source.c_str(), topic.c_str(), sensor_frame.c_str());
 
     // create an observation buffer
-    observation_buffers_.push_back(std::shared_ptr<ObservationBufferWithBase>(
+    observation_buffers_.push_back(
+      std::shared_ptr<ObservationBufferWithBase>(
         new ObservationBufferWithBase(
-            node, topic, observation_keep_time, expected_update_rate,
-            min_obstacle_height, max_obstacle_height, obstacle_max_range,
-            obstacle_min_range, raytrace_max_range, raytrace_min_range, *tf_,
-            global_frame_, sensor_frame,
-            tf2::durationFromSec(transform_tolerance), max_observation_age)));
+          node, topic, observation_keep_time, expected_update_rate, min_obstacle_height,
+          max_obstacle_height, obstacle_max_range, obstacle_min_range, raytrace_max_range,
+          raytrace_min_range, *tf_, global_frame_, sensor_frame,
+          tf2::durationFromSec(transform_tolerance), max_observation_age)));
 
     // check if we'll add this buffer to our marking observation buffers
     if (marking) {
@@ -230,67 +227,67 @@ void ObstacleDecayLayer::onInitialize() {
       clearing_buffers_.push_back(observation_buffers_.back());
     }
 
-    RCLCPP_DEBUG(logger_,
-                 "Created an observation buffer for source %s, topic %s, "
-                 "global frame: %s, "
-                 "expected update rate: %.2f, observation persistence: %.2f",
-                 source.c_str(), topic.c_str(), global_frame_.c_str(),
-                 expected_update_rate, observation_keep_time);
+    RCLCPP_DEBUG(
+      logger_,
+      "Created an observation buffer for source %s, topic %s, "
+      "global frame: %s, "
+      "expected update rate: %.2f, observation persistence: %.2f",
+      source.c_str(), topic.c_str(), global_frame_.c_str(), expected_update_rate,
+      observation_keep_time);
 
     rmw_qos_profile_t custom_qos_profile = rmw_qos_profile_sensor_data;
     custom_qos_profile.depth = 50;
 
     // create a callback for the topic
     if (data_type == "LaserScan") {
-      auto sub = std::make_shared<message_filters::Subscriber<
-          sensor_msgs::msg::LaserScan, rclcpp_lifecycle::LifecycleNode>>(
-          node, topic, custom_qos_profile, sub_opt);
+      auto sub = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::LaserScan,
+          rclcpp_lifecycle::LifecycleNode>>(
+        node, topic, custom_qos_profile, sub_opt);
       sub->unsubscribe();
 
-      auto filter =
-          std::make_shared<tf2_ros::MessageFilter<sensor_msgs::msg::LaserScan>>(
-              *sub, *tf_, global_frame_, 50, node->get_node_logging_interface(),
-              node->get_node_clock_interface(),
-              tf2::durationFromSec(transform_tolerance));
+      auto filter = std::make_shared<tf2_ros::MessageFilter<sensor_msgs::msg::LaserScan>>(
+        *sub, *tf_, global_frame_, 50, node->get_node_logging_interface(),
+        node->get_node_clock_interface(), tf2::durationFromSec(transform_tolerance));
 
       if (inf_is_valid) {
         filter->registerCallback(
-            std::bind(&ObstacleDecayLayer::laserScanValidInfCallback, this,
-                      std::placeholders::_1, observation_buffers_.back()));
+          std::bind(
+            &ObstacleDecayLayer::laserScanValidInfCallback, this,
+            std::placeholders::_1, observation_buffers_.back()));
 
       } else {
         filter->registerCallback(
-            std::bind(&ObstacleDecayLayer::laserScanCallback, this,
-                      std::placeholders::_1, observation_buffers_.back()));
+          std::bind(
+            &ObstacleDecayLayer::laserScanCallback, this,
+            std::placeholders::_1, observation_buffers_.back()));
       }
 
       observation_subscribers_.push_back(sub);
 
       observation_notifiers_.push_back(filter);
-      observation_notifiers_.back()->setTolerance(
-          rclcpp::Duration::from_seconds(0.05));
+      observation_notifiers_.back()->setTolerance(rclcpp::Duration::from_seconds(0.05));
 
     } else {
-      auto sub = std::make_shared<message_filters::Subscriber<
-          sensor_msgs::msg::PointCloud2, rclcpp_lifecycle::LifecycleNode>>(
-          node, topic, custom_qos_profile, sub_opt);
+      auto sub = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2,
+          rclcpp_lifecycle::LifecycleNode>>(
+        node, topic, custom_qos_profile, sub_opt);
       sub->unsubscribe();
 
       if (inf_is_valid) {
-        RCLCPP_WARN(logger_,
-                    "obstacle_layer: inf_is_valid option is not applicable to "
-                    "PointCloud observations.");
+        RCLCPP_WARN(
+          logger_,
+          "obstacle_layer: inf_is_valid option is not applicable to "
+          "PointCloud observations.");
       }
 
-      auto filter = std::make_shared<
-          tf2_ros::MessageFilter<sensor_msgs::msg::PointCloud2>>(
-          *sub, *tf_, global_frame_, 50, node->get_node_logging_interface(),
-          node->get_node_clock_interface(),
-          tf2::durationFromSec(transform_tolerance));
+      auto filter = std::make_shared<tf2_ros::MessageFilter<sensor_msgs::msg::PointCloud2>>(
+        *sub, *tf_, global_frame_, 50, node->get_node_logging_interface(),
+        node->get_node_clock_interface(), tf2::durationFromSec(transform_tolerance));
 
       filter->registerCallback(
-          std::bind(&ObstacleDecayLayer::pointCloud2Callback, this,
-                    std::placeholders::_1, observation_buffers_.back()));
+        std::bind(
+          &ObstacleDecayLayer::pointCloud2Callback, this,
+          std::placeholders::_1, observation_buffers_.back()));
 
       observation_subscribers_.push_back(sub);
       observation_notifiers_.push_back(filter);
@@ -305,31 +302,106 @@ void ObstacleDecayLayer::onInitialize() {
   }
 }
 
-rcl_interfaces::msg::SetParametersResult
-ObstacleDecayLayer::dynamicParametersCallback(
-    std::vector<rclcpp::Parameter> parameters) {
+rcl_interfaces::msg::SetParametersResult ObstacleDecayLayer::dynamicParametersCallback(
+  std::vector<rclcpp::Parameter> parameters)
+{
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   rcl_interfaces::msg::SetParametersResult result;
 
-  for (auto parameter : parameters) {
-    const auto& param_type = parameter.get_type();
-    const auto& param_name = parameter.get_name();
-
-    if (param_type == ParameterType::PARAMETER_DOUBLE) {
-      if (param_name == name_ + "." + "min_obstacle_height") {
-        min_obstacle_height_ = parameter.as_double();
-      } else if (param_name == name_ + "." + "max_obstacle_height") {
-        max_obstacle_height_ = parameter.as_double();
+  const std::string parameter_prefix = name_ + ".";
+  const auto is_snapshot_startup_parameter =
+    [this, &parameter_prefix](const std::string & parameter_name) {
+      if (parameter_name == parameter_prefix + "snapshot_input_enabled") {
+        // This switch is declared in both modes, but changing it cannot
+        // create or destroy the subscription/evidence state safely.
+        return true;
       }
-    } else if (param_type == ParameterType::PARAMETER_BOOL) {
+      if (!snapshot_input_enabled_) {
+        // The remaining snapshot parameters are not declared in legacy mode.
+        return false;
+      }
+      return parameter_name == parameter_prefix + "snapshot_topic" ||
+             parameter_name == parameter_prefix + "unreported_cells_are_free" ||
+             parameter_name == parameter_prefix + "max_status_age" ||
+             parameter_name == parameter_prefix + "max_capture_age" ||
+             parameter_name == parameter_prefix + "future_tolerance" ||
+             parameter_name == parameter_prefix + "snapshot_transform_tolerance" ||
+             parameter_name == parameter_prefix + "max_grid_cells" ||
+             parameter_name == parameter_prefix + "max_measurement_cells" ||
+             parameter_name == parameter_prefix + "max_rasterized_cells" ||
+             parameter_name == parameter_prefix + "hit_count_threshold" ||
+             parameter_name == parameter_prefix + "miss_decrement" ||
+             parameter_name == parameter_prefix + "clear_threshold" ||
+             parameter_name == parameter_prefix + "max_persistent_cells";
+    };
+
+  // Validate the complete atomic update before changing any member. ROS rolls
+  // back a rejected parameter transaction, so mutating a preceding parameter
+  // here would otherwise leave the layer inconsistent with the node state.
+  double proposed_min_obstacle_height = min_obstacle_height_;
+  double proposed_max_obstacle_height = max_obstacle_height_;
+  std::int64_t proposed_combination_method = combination_method_;
+  for (const auto & parameter : parameters) {
+    const auto & param_type = parameter.get_type();
+    const auto & param_name = parameter.get_name();
+    if (is_snapshot_startup_parameter(param_name)) {
+      result.successful = false;
+      result.reason = "snapshot obstacle parameters are startup-only";
+      return result;
+    }
+    if (param_type == ParameterType::PARAMETER_BOOL) {
+      if (snapshot_input_enabled_ && param_name == name_ + "." + "enabled") {
+        result.successful = false;
+        result.reason = "snapshot obstacle layer enable policy is startup-only";
+        return result;
+      }
+      if (snapshot_input_enabled_ && param_name == name_ + "." + "footprint_clearing_enabled") {
+        result.successful = false;
+        result.reason = "snapshot footprint clearing policy is startup-only";
+        return result;
+      }
+    }
+    if (param_type == ParameterType::PARAMETER_DOUBLE) {
+      if (param_name == parameter_prefix + "min_obstacle_height") {
+        proposed_min_obstacle_height = parameter.as_double();
+      } else if (param_name == parameter_prefix + "max_obstacle_height") {
+        proposed_max_obstacle_height = parameter.as_double();
+      }
+    } else if (param_type == ParameterType::PARAMETER_INTEGER &&
+      param_name == parameter_prefix + "combination_method")
+    {
+      proposed_combination_method = parameter.as_int();
+    }
+  }
+
+  if (!std::isfinite(proposed_min_obstacle_height) ||
+    !std::isfinite(proposed_max_obstacle_height) ||
+    proposed_min_obstacle_height > proposed_max_obstacle_height)
+  {
+    result.successful = false;
+    result.reason =
+      "obstacle height limits must be finite and min_obstacle_height must not exceed "
+      "max_obstacle_height";
+    return result;
+  }
+  if (proposed_combination_method != 0 && proposed_combination_method != 1) {
+    result.successful = false;
+    result.reason = "combination_method must be 0 (overwrite) or 1 (maximum)";
+    return result;
+  }
+
+  min_obstacle_height_ = proposed_min_obstacle_height;
+  max_obstacle_height_ = proposed_max_obstacle_height;
+  combination_method_ = static_cast<int>(proposed_combination_method);
+  for (const auto & parameter : parameters) {
+    const auto & param_type = parameter.get_type();
+    const auto & param_name = parameter.get_name();
+
+    if (param_type == ParameterType::PARAMETER_BOOL) {
       if (param_name == name_ + "." + "enabled") {
         enabled_ = parameter.as_bool();
       } else if (param_name == name_ + "." + "footprint_clearing_enabled") {
         footprint_clearing_enabled_ = parameter.as_bool();
-      }
-    } else if (param_type == ParameterType::PARAMETER_INTEGER) {
-      if (param_name == name_ + "." + "combination_method") {
-        combination_method_ = parameter.as_int();
       }
     }
   }
@@ -339,28 +411,30 @@ ObstacleDecayLayer::dynamicParametersCallback(
 }
 
 void ObstacleDecayLayer::laserScanCallback(
-    sensor_msgs::msg::LaserScan::ConstSharedPtr message,
-    const std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase>& buffer) {
+  sensor_msgs::msg::LaserScan::ConstSharedPtr message,
+  const std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase> & buffer)
+{
   // project the laser into a point cloud
   sensor_msgs::msg::PointCloud2 cloud;
   cloud.header = message->header;
 
   // project the scan into a point cloud
   try {
-    projector_.transformLaserScanToPointCloud(message->header.frame_id,
-                                              *message, cloud, *tf_);
-  } catch (tf2::TransformException& ex) {
-    RCLCPP_WARN(logger_,
-                "High fidelity enabled, but TF returned a transform exception "
-                "to frame %s: %s",
-                global_frame_.c_str(), ex.what());
+    projector_.transformLaserScanToPointCloud(message->header.frame_id, *message, cloud, *tf_);
+  } catch (tf2::TransformException & ex) {
+    RCLCPP_WARN(
+      logger_,
+      "High fidelity enabled, but TF returned a transform exception "
+      "to frame %s: %s",
+      global_frame_.c_str(), ex.what());
     projector_.projectLaser(*message, cloud);
-  } catch (std::runtime_error& ex) {
-    RCLCPP_WARN(logger_,
-                "transformLaserScanToPointCloud error, it seems the message "
-                "from laser is malformed."
-                " Ignore this message. what(): %s",
-                ex.what());
+  } catch (std::runtime_error & ex) {
+    RCLCPP_WARN(
+      logger_,
+      "transformLaserScanToPointCloud error, it seems the message "
+      "from laser is malformed."
+      " Ignore this message. what(): %s",
+      ex.what());
     buffer->invalidate();
     return;
   }
@@ -372,8 +446,9 @@ void ObstacleDecayLayer::laserScanCallback(
 }
 
 void ObstacleDecayLayer::laserScanValidInfCallback(
-    sensor_msgs::msg::LaserScan::ConstSharedPtr raw_message,
-    const std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase>& buffer) {
+  sensor_msgs::msg::LaserScan::ConstSharedPtr raw_message,
+  const std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase> & buffer)
+{
   // Filter positive infinities ("Inf"s) to max_range.
   float epsilon = 0.0001;  // a tenth of a millimeter
   sensor_msgs::msg::LaserScan message = *raw_message;
@@ -390,20 +465,21 @@ void ObstacleDecayLayer::laserScanValidInfCallback(
 
   // project the scan into a point cloud
   try {
-    projector_.transformLaserScanToPointCloud(message.header.frame_id, message,
-                                              cloud, *tf_);
-  } catch (tf2::TransformException& ex) {
-    RCLCPP_WARN(logger_,
-                "High fidelity enabled, but TF returned a transform exception "
-                "to frame %s: %s",
-                global_frame_.c_str(), ex.what());
+    projector_.transformLaserScanToPointCloud(message.header.frame_id, message, cloud, *tf_);
+  } catch (tf2::TransformException & ex) {
+    RCLCPP_WARN(
+      logger_,
+      "High fidelity enabled, but TF returned a transform exception "
+      "to frame %s: %s",
+      global_frame_.c_str(), ex.what());
     projector_.projectLaser(message, cloud);
-  } catch (std::runtime_error& ex) {
-    RCLCPP_WARN(logger_,
-                "transformLaserScanToPointCloud error, it seems the message "
-                "from laser is malformed."
-                " Ignore this message. what(): %s",
-                ex.what());
+  } catch (std::runtime_error & ex) {
+    RCLCPP_WARN(
+      logger_,
+      "transformLaserScanToPointCloud error, it seems the message "
+      "from laser is malformed."
+      " Ignore this message. what(): %s",
+      ex.what());
     buffer->invalidate();
     return;
   }
@@ -415,24 +491,29 @@ void ObstacleDecayLayer::laserScanValidInfCallback(
 }
 
 void ObstacleDecayLayer::pointCloud2Callback(
-    sensor_msgs::msg::PointCloud2::ConstSharedPtr message,
-    const std::shared_ptr<ObservationBufferWithBase>& buffer) {
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr message,
+  const std::shared_ptr<ObservationBufferWithBase> & buffer)
+{
   // buffer the point cloud
   buffer->lock();
   buffer->bufferCloud(*message);
   buffer->unlock();
 }
 
-void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
-                                      double robot_yaw, double* min_x,
-                                      double* min_y, double* max_x,
-                                      double* max_y) {
+void ObstacleDecayLayer::updateBounds(
+  double robot_x, double robot_y, double robot_yaw,
+  double * min_x, double * min_y, double * max_x, double * max_y)
+{
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   if (rolling_window_) {
-    updateOrigin(robot_x - getSizeInMetersX() / 2,
-                 robot_y - getSizeInMetersY() / 2);
+    updateOrigin(robot_x - getSizeInMetersX() / 2, robot_y - getSizeInMetersY() / 2);
   }
   if (!enabled_) {
+    return;
+  }
+  if (snapshot_input_enabled_) {
+    useExtraBounds(min_x, min_y, max_x, max_y);
+    updateSnapshotBounds(robot_x, robot_y, robot_yaw, min_x, min_y, max_x, max_y);
     return;
   }
   useExtraBounds(min_x, min_y, max_x, max_y);
@@ -442,7 +523,8 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
   pending_observations_.clear();
   std::vector<Observation> observations, clearing_observations;
   const bool marking_current = getMarkingObservations(observations, &pending_observations_);
-  const bool clearing_current = getClearingObservations(clearing_observations, &pending_observations_);
+  const bool clearing_current =
+    getClearingObservations(clearing_observations, &pending_observations_);
 
   // Always merge the retained grid, including while observations are unavailable.
   *min_x = robot_x - getSizeInMetersX();
@@ -467,16 +549,15 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
 
   // place the new obstacles into a priority queue... each with a priority of
   // zero to begin with
-  for (std::vector<Observation>::const_iterator it = observations.begin();
-       it != observations.end(); ++it) {
-    const Observation& obs = *it;
+  for (std::vector<Observation>::const_iterator it = observations.begin(); it != observations.end();
+    ++it)
+  {
+    const Observation & obs = *it;
 
-    const sensor_msgs::msg::PointCloud2& cloud = *(obs.cloud_);
+    const sensor_msgs::msg::PointCloud2 & cloud = *(obs.cloud_);
 
-    double sq_obstacle_max_range =
-        obs.obstacle_max_range_ * obs.obstacle_max_range_;
-    double sq_obstacle_min_range =
-        obs.obstacle_min_range_ * obs.obstacle_min_range_;
+    double sq_obstacle_max_range = obs.obstacle_max_range_ * obs.obstacle_max_range_;
+    double sq_obstacle_min_range = obs.obstacle_min_range_ * obs.obstacle_min_range_;
 
     sensor_msgs::PointCloud2ConstIterator<float> iter_x(cloud, "x");
     sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
@@ -501,8 +582,8 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
       // compute the squared distance from the hitpoint to the pointcloud's
       // origin
       double sq_dist = (px - obs.origin_.x) * (px - obs.origin_.x) +
-                       (py - obs.origin_.y) * (py - obs.origin_.y) +
-                       (pz - obs.origin_.z) * (pz - obs.origin_.z);
+        (py - obs.origin_.y) * (py - obs.origin_.y) +
+        (pz - obs.origin_.z) * (pz - obs.origin_.z);
 
       // if the point is far enough away... we won't consider it
       if (sq_dist >= sq_obstacle_max_range) {
@@ -528,7 +609,7 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
       // touch(px, py, min_x, min_y, max_x, max_y);
 
       unsigned int index = getIndex(mx, my);
-      Grid& grid = tmp_costmap_.at(index);
+      Grid & grid = tmp_costmap_.at(index);
       ++grid.count_;
       touch(px, py, &grid.min_x_, &grid.min_y_, &grid.max_x_, &grid.max_y_);
     }
@@ -538,7 +619,7 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
   for (size_t idx_x = 0; idx_x < size_x_; ++idx_x) {
     for (size_t idx_y = 0; idx_y < size_y_; ++idx_y) {
       unsigned int index = getIndex(idx_x, idx_y);
-      const Grid& grid = tmp_costmap_.at(index);
+      const Grid & grid = tmp_costmap_.at(index);
       if (obstacle_pointcount_ <= grid.count_) {
         costmap_[index] = LETHAL_OBSTACLE;
         touch(grid.min_x_, grid.min_y_, min_x, min_y, max_x, max_y);
@@ -551,31 +632,31 @@ void ObstacleDecayLayer::updateBounds(double robot_x, double robot_y,
   update_pending_ = true;
 }
 
-void ObstacleDecayLayer::updateFootprint(double robot_x, double robot_y,
-                                         double robot_yaw, double* min_x,
-                                         double* min_y, double* max_x,
-                                         double* max_y) {
+void ObstacleDecayLayer::updateFootprint(
+  double robot_x, double robot_y, double robot_yaw,
+  double * min_x, double * min_y, double * max_x,
+  double * max_y)
+{
   if (!footprint_clearing_enabled_) {
     return;
   }
-  transformFootprint(robot_x, robot_y, robot_yaw, getFootprint(),
-                     transformed_footprint_);
+  transformFootprint(robot_x, robot_y, robot_yaw, getFootprint(), transformed_footprint_);
 
   for (unsigned int i = 0; i < transformed_footprint_.size(); i++) {
-    touch(transformed_footprint_[i].x, transformed_footprint_[i].y, min_x,
-          min_y, max_x, max_y);
+    touch(transformed_footprint_[i].x, transformed_footprint_[i].y, min_x, min_y, max_x, max_y);
   }
 }
 
-void ObstacleDecayLayer::updateCosts(nav2_costmap_2d::Costmap2D& master_grid,
-                                     int min_i, int min_j, int max_i,
-                                     int max_j) {
+void ObstacleDecayLayer::updateCosts(
+  nav2_costmap_2d::Costmap2D & master_grid, int min_i, int min_j,
+  int max_i, int max_j)
+{
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   if (!enabled_) {
     return;
   }
 
-  if (update_pending_ && footprint_clearing_enabled_) {
+  if (update_pending_ && footprint_clearing_enabled_ && !snapshot_input_enabled_) {
     setConvexPolygonCost(transformed_footprint_, nav2_costmap_2d::FREE_SPACE);
   }
 
@@ -591,14 +672,20 @@ void ObstacleDecayLayer::updateCosts(nav2_costmap_2d::Costmap2D& master_grid,
       return;
   }
   if (update_pending_) {
-    applied_observations_ = pending_observations_;
+    if (!snapshot_input_enabled_) {
+      applied_observations_ = pending_observations_;
+    }
     update_pending_ = false;
     current_ = true;
   }
 }
 
-bool ObstacleDecayLayer::isCurrent() const {
+bool ObstacleDecayLayer::isCurrent() const
+{
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
+  if (snapshot_input_enabled_) {
+    return snapshotCurrentLocked(clock_->now().nanoseconds());
+  }
   if (!current_) {
     return false;
   }
@@ -610,8 +697,10 @@ bool ObstacleDecayLayer::isCurrent() const {
   return true;
 }
 
-void ObstacleDecayLayer::addStaticObservation(nav2_costmap_2d::Observation& obs,
-                                              bool marking, bool clearing) {
+void ObstacleDecayLayer::addStaticObservation(
+  nav2_costmap_2d::Observation & obs, bool marking,
+  bool clearing)
+{
   if (marking) {
     static_marking_observations_.push_back(obs);
   }
@@ -620,7 +709,8 @@ void ObstacleDecayLayer::addStaticObservation(nav2_costmap_2d::Observation& obs,
   }
 }
 
-void ObstacleDecayLayer::clearStaticObservations(bool marking, bool clearing) {
+void ObstacleDecayLayer::clearStaticObservations(bool marking, bool clearing)
+{
   if (marking) {
     static_marking_observations_.clear();
   }
@@ -630,8 +720,9 @@ void ObstacleDecayLayer::clearStaticObservations(bool marking, bool clearing) {
 }
 
 bool ObstacleDecayLayer::getMarkingObservations(
-    std::vector<Observation>& marking_observations,
-    std::vector<BufferedFreshness> * snapshots) const {
+  std::vector<Observation> & marking_observations,
+  std::vector<BufferedFreshness> * snapshots) const
+{
   bool current = true;
   // get the marking observations
   for (unsigned int i = 0; i < marking_buffers_.size(); ++i) {
@@ -644,15 +735,16 @@ bool ObstacleDecayLayer::getMarkingObservations(
     current = marking_buffers_[i]->isCurrent() && current;
     marking_buffers_[i]->unlock();
   }
-  marking_observations.insert(marking_observations.end(),
-                              static_marking_observations_.begin(),
-                              static_marking_observations_.end());
+  marking_observations.insert(
+    marking_observations.end(), static_marking_observations_.begin(),
+    static_marking_observations_.end());
   return current;
 }
 
 bool ObstacleDecayLayer::getClearingObservations(
-    std::vector<Observation>& clearing_observations,
-    std::vector<BufferedFreshness> * snapshots) const {
+  std::vector<Observation> & clearing_observations,
+  std::vector<BufferedFreshness> * snapshots) const
+{
   bool current = true;
   // get the clearing observations
   for (unsigned int i = 0; i < clearing_buffers_.size(); ++i) {
@@ -665,28 +757,30 @@ bool ObstacleDecayLayer::getClearingObservations(
     current = clearing_buffers_[i]->isCurrent() && current;
     clearing_buffers_[i]->unlock();
   }
-  clearing_observations.insert(clearing_observations.end(),
-                               static_clearing_observations_.begin(),
-                               static_clearing_observations_.end());
+  clearing_observations.insert(
+    clearing_observations.end(), static_clearing_observations_.begin(),
+    static_clearing_observations_.end());
   return current;
 }
 
 void ObstacleDecayLayer::raytraceFreespace(
-    const Observation& clearing_observation, double* min_x, double* min_y,
-    double* max_x, double* max_y) {
+  const Observation & clearing_observation, double * min_x,
+  double * min_y, double * max_x, double * max_y)
+{
   double ox = clearing_observation.origin_.x;
   double oy = clearing_observation.origin_.y;
-  const sensor_msgs::msg::PointCloud2& cloud = *(clearing_observation.cloud_);
+  const sensor_msgs::msg::PointCloud2 & cloud = *(clearing_observation.cloud_);
 
   // get the map coordinates of the origin of the sensor
   unsigned int x0, y0;
   if (!worldToMap(ox, oy, x0, y0)) {
-    RCLCPP_WARN(logger_,
-                "Sensor origin at (%.2f, %.2f) is out of map bounds (%.2f, "
-                "%.2f) to (%.2f, %.2f). "
-                "The costmap cannot raytrace for it.",
-                ox, oy, origin_x_, origin_y_, origin_x_ + getSizeInMetersX(),
-                origin_y_ + getSizeInMetersY());
+    RCLCPP_WARN(
+      logger_,
+      "Sensor origin at (%.2f, %.2f) is out of map bounds (%.2f, "
+      "%.2f) to (%.2f, %.2f). "
+      "The costmap cannot raytrace for it.",
+      ox, oy, origin_x_, origin_y_, origin_x_ + getSizeInMetersX(),
+      origin_y_ + getSizeInMetersY());
     return;
   }
 
@@ -745,29 +839,32 @@ void ObstacleDecayLayer::raytraceFreespace(
       continue;
     }
 
-    unsigned int cell_raytrace_max_range =
-        cellDistance(clearing_observation.raytrace_max_range_);
-    unsigned int cell_raytrace_min_range =
-        cellDistance(clearing_observation.raytrace_min_range_);
+    unsigned int cell_raytrace_max_range = cellDistance(clearing_observation.raytrace_max_range_);
+    unsigned int cell_raytrace_min_range = cellDistance(clearing_observation.raytrace_min_range_);
     MarkCell marker(costmap_, FREE_SPACE);
     // and finally... we can execute our trace to clear obstacles along that
     // line
-    raytraceLine(marker, x0, y0, x1, y1, cell_raytrace_max_range,
-                 cell_raytrace_min_range);
+    raytraceLine(marker, x0, y0, x1, y1, cell_raytrace_max_range, cell_raytrace_min_range);
 
     updateRaytraceBounds(
-        ox, oy, wx, wy, clearing_observation.raytrace_max_range_,
-        clearing_observation.raytrace_min_range_, min_x, min_y, max_x, max_y);
+      ox, oy, wx, wy, clearing_observation.raytrace_max_range_,
+      clearing_observation.raytrace_min_range_, min_x, min_y, max_x, max_y);
   }
 }
 
-void ObstacleDecayLayer::activate() {
+void ObstacleDecayLayer::activate()
+{
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   current_ = false;
   applied_observations_.clear();
   pending_observations_.clear();
   update_pending_ = false;
-  for (auto& notifier : observation_notifiers_) {
+  if (snapshot_input_enabled_) {
+    snapshot_active_ = true;
+    latest_snapshot_.reset();
+    return;
+  }
+  for (auto & notifier : observation_notifiers_) {
     notifier->clear();
   }
 
@@ -783,9 +880,16 @@ void ObstacleDecayLayer::activate() {
   resetBuffersLastUpdated();
 }
 
-void ObstacleDecayLayer::deactivate() {
+void ObstacleDecayLayer::deactivate()
+{
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   current_ = false;
+  if (snapshot_input_enabled_) {
+    snapshot_active_ = false;
+    latest_snapshot_.reset();
+    update_pending_ = false;
+    return;
+  }
   for (unsigned int i = 0; i < observation_subscribers_.size(); ++i) {
     if (observation_subscribers_[i] != NULL) {
       observation_subscribers_[i]->unsubscribe();
@@ -796,11 +900,11 @@ void ObstacleDecayLayer::deactivate() {
   tmp_costmap_.clear();
 }
 
-void ObstacleDecayLayer::updateRaytraceBounds(double ox, double oy, double wx,
-                                              double wy, double max_range,
-                                              double min_range, double* min_x,
-                                              double* min_y, double* max_x,
-                                              double* max_y) {
+void ObstacleDecayLayer::updateRaytraceBounds(
+  double ox, double oy, double wx, double wy,
+  double max_range, double min_range, double * min_x,
+  double * min_y, double * max_x, double * max_y)
+{
   double dx = wx - ox, dy = wy - oy;
   double full_distance = hypot(dx, dy);
   if (full_distance < min_range) {
@@ -811,17 +915,32 @@ void ObstacleDecayLayer::updateRaytraceBounds(double ox, double oy, double wx,
   touch(ex, ey, min_x, min_y, max_x, max_y);
 }
 
-void ObstacleDecayLayer::reset() {
+void ObstacleDecayLayer::reset()
+{
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   resetMaps();
-  resetBuffersLastUpdated();
   current_ = false;
   update_pending_ = false;
   applied_observations_.clear();
   pending_observations_.clear();
+  if (snapshot_input_enabled_) {
+    latest_snapshot_.reset();
+    has_snapshot_watermark_ = false;
+    watermark_generation_ = 0U;
+    watermark_sequence_ = 0U;
+    last_evidence_generation_ = 0U;
+    last_valid_capture_ns_ = 0;
+    last_valid_status_ns_ = 0;
+    temporal_evidence_->reset();
+    const unsigned char background = unreported_cells_are_free_ ? FREE_SPACE : NO_INFORMATION;
+    std::fill(costmap_, costmap_ + size_x_ * size_y_, background);
+    return;
+  }
+  resetBuffersLastUpdated();
 }
 
-void ObstacleDecayLayer::resetBuffersLastUpdated() {
+void ObstacleDecayLayer::resetBuffersLastUpdated()
+{
   for (unsigned int i = 0; i < observation_buffers_.size(); ++i) {
     if (observation_buffers_[i]) {
       observation_buffers_[i]->resetLastUpdated();

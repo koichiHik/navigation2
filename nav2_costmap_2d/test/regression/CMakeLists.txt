@@ -22,3 +22,11 @@ ament_add_gtest(plugin_api_order plugin_api_order.cpp)
 target_link_libraries(plugin_api_order
   nav2_costmap_2d_core
 )
+
+# Keep this executable free of a direct layers link: pluginlib must be the sole
+# loader and owner of every layer factory.
+ament_add_gtest(obstacle_decay_pluginlib obstacle_decay_pluginlib.cpp)
+ament_target_dependencies(obstacle_decay_pluginlib pluginlib)
+target_link_libraries(obstacle_decay_pluginlib
+  nav2_costmap_2d_core
+)

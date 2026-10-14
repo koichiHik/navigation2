@@ -39,10 +39,12 @@
 #ifndef NAV2_COSTMAP_2D__OBSTACLE_DECAY_LAYER_HPP_
 #define NAV2_COSTMAP_2D__OBSTACLE_DECAY_LAYER_HPP_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "camera_localization_msgs/msg/obstacle_grid_snapshot.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "laser_geometry/laser_geometry.hpp"
 #pragma GCC diagnostic push
@@ -58,6 +60,7 @@
 #include "nav2_costmap_2d/layered_costmap.hpp"
 #include "nav2_costmap_2d/observation_buffer_with_base.hpp"
 #include "nav2_costmap_2d/footprint.hpp"
+#include "nav2_costmap_2d/temporal_obstacle_evidence.hpp"
 
 namespace nav2_costmap_2d
 {
@@ -173,6 +176,10 @@ public:
     sensor_msgs::msg::PointCloud2::ConstSharedPtr message,
     const std::shared_ptr<nav2_costmap_2d::ObservationBufferWithBase> & buffer);
 
+  /** Accepted-cell snapshot input. Public to support deterministic layer tests. */
+  void obstacleGridSnapshotCallback(
+    camera_localization_msgs::msg::ObstacleGridSnapshot::ConstSharedPtr message);
+
   // for testing purposes
   void addStaticObservation(nav2_costmap_2d::Observation & obs, bool marking, bool clearing);
   void clearStaticObservations(bool marking, bool clearing);
@@ -269,9 +276,10 @@ protected:
   int combination_method_;
 
 private:
-  struct Grid {
-    Grid() : 
-      min_x_(0.0), 
+  struct Grid
+  {
+    Grid()
+    : min_x_(0.0),
       min_y_(0.0),
       max_x_(0.0),
       max_y_(0.0),
@@ -284,8 +292,44 @@ private:
   };
 
   std::vector<Grid> tmp_costmap_;
-};
 
+  void updateSnapshotBounds(
+    double robot_x, double robot_y, double robot_yaw, double * min_x, double * min_y,
+    double * max_x, double * max_y);
+  [[nodiscard]] bool snapshotCurrentLocked(std::int64_t now_ns) const noexcept;
+  [[nodiscard]] bool validateSnapshotLocked(
+    const camera_localization_msgs::msg::ObstacleGridSnapshot & snapshot,
+    std::int64_t now_ns) const noexcept;
+  void invalidateSnapshotLocked() noexcept;
+  void renderTemporalEvidenceLocked();
+  [[nodiscard]] bool initializeSnapshotInput(const std::string & legacy_topics);
+
+  bool snapshot_input_enabled_{false};
+  bool snapshot_active_{false};
+  bool unreported_cells_are_free_{true};
+  std::string snapshot_topic_;
+  double snapshot_transform_tolerance_sec_{0.2};
+  std::int64_t maximum_status_age_ns_{500'000'000LL};
+  std::int64_t maximum_capture_age_ns_{500'000'000LL};
+  std::int64_t future_tolerance_ns_{50'000'000LL};
+  std::size_t maximum_grid_cells_{1'000'000U};
+  std::size_t maximum_measurement_cells_{100'000U};
+  std::size_t maximum_rasterized_cells_{500'000U};
+  double evidence_resolution_m_{0.0};
+  TemporalEvidenceParameters temporal_evidence_parameters_;
+  std::unique_ptr<TemporalObstacleEvidence> temporal_evidence_;
+  rclcpp::Subscription<camera_localization_msgs::msg::ObstacleGridSnapshot>::SharedPtr
+    snapshot_subscription_;
+  camera_localization_msgs::msg::ObstacleGridSnapshot::ConstSharedPtr
+    latest_snapshot_;
+  bool has_snapshot_watermark_{false};
+  std::uint64_t watermark_generation_{0U};
+  std::uint64_t watermark_sequence_{0U};
+  std::uint64_t last_evidence_generation_{0U};
+  std::int64_t last_valid_capture_ns_{0};
+  std::int64_t last_valid_status_ns_{0};
+
+};
 }  // namespace nav2_costmap_2d
 
 #endif  // NAV2_COSTMAP_2D__OBSTACLE_LAYER_HPP_
