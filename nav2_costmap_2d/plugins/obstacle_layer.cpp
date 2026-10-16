@@ -418,8 +418,11 @@ void ObstacleLayer::updateBounds(double robot_x, double robot_y,
                                  double* max_x, double* max_y) {
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   if (rolling_window_) {
-    updateOrigin(robot_x - getSizeInMetersX() / 2,
-                 robot_y - getSizeInMetersY() / 2);
+    double new_origin_x = 0.0;
+    double new_origin_y = 0.0;
+    layered_costmap_->getRollingWindowOrigin(
+      robot_x, robot_y, robot_yaw, new_origin_x, new_origin_y);
+    updateOrigin(new_origin_x, new_origin_y);
   }
   if (!enabled_) {
     return;

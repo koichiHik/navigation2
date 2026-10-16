@@ -3,8 +3,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -171,9 +174,11 @@ protected:
     layer_->obstacleGridSnapshotCallback(std::make_shared<Snapshot>(value));
   }
 
-  void update(const double robot_x = 5.0, const double robot_y = 5.0)
+  void update(
+    const double robot_x = 5.0, const double robot_y = 5.0,
+    const double robot_yaw = 0.0)
   {
-    map_->updateMap(robot_x, robot_y, 0.0);
+    map_->updateMap(robot_x, robot_y, robot_yaw);
   }
 
   unsigned char cost(const double x, const double y)
@@ -386,6 +391,64 @@ TEST_F(RollingSnapshotTest, RobotMotionMapsDifferentLocalCellsToSameWorldEvidenc
   update(6.0, 5.0);
   EXPECT_DOUBLE_EQ(map_->getCostmap()->getOriginX(), 1.0);
   EXPECT_EQ(cost(8.25, 5.05), LETHAL_OBSTACLE);
+}
+
+TEST_F(RollingSnapshotTest, ForwardOffsetSharesOriginAndCoversRequiredEnvelope) {
+  constexpr double kResolution = 0.1;
+  constexpr double kForwardOffset = 5.0;
+  constexpr double kRobotX = 42.0;
+  constexpr double kRobotY = -17.0;
+  constexpr double kPi = 3.14159265358979323846;
+  map_->resizeMap(200U, 200U, kResolution, 0.0, 0.0);
+  map_->setRollingWindowForwardOffset(kForwardOffset);
+
+  Costmap2D * const master = map_->getCostmap();
+  for (int degrees = 0; degrees < 360; ++degrees) {
+    SCOPED_TRACE(degrees);
+    const double yaw = static_cast<double>(degrees) * kPi / 180.0;
+    const double forward_x = std::cos(yaw);
+    const double forward_y = std::sin(yaw);
+    const double left_x = -forward_y;
+    const double left_y = forward_x;
+    update(kRobotX, kRobotY, yaw);
+
+    EXPECT_DOUBLE_EQ(master->getOriginX(), layer_->getOriginX());
+    EXPECT_DOUBLE_EQ(master->getOriginY(), layer_->getOriginY());
+
+    const double requested_center_x = kRobotX + kForwardOffset * forward_x;
+    const double requested_center_y = kRobotY + kForwardOffset * forward_y;
+    const double actual_center_x =
+      master->getOriginX() + master->getSizeInMetersX() / 2.0;
+    const double actual_center_y =
+      master->getOriginY() + master->getSizeInMetersY() / 2.0;
+    EXPECT_LE(std::abs(actual_center_x - requested_center_x), kResolution + 1e-12);
+    EXPECT_LE(std::abs(actual_center_y - requested_center_y), kResolution + 1e-12);
+
+    const auto expect_inside = [&](const double forward_distance, const double left_distance) {
+        const double x = kRobotX + forward_distance * forward_x + left_distance * left_x;
+        const double y = kRobotY + forward_distance * forward_y + left_distance * left_y;
+        unsigned int mx = 0U;
+        unsigned int my = 0U;
+        EXPECT_TRUE(master->worldToMap(x, y, mx, my));
+        EXPECT_TRUE(layer_->worldToMap(x, y, mx, my));
+      };
+    expect_inside(14.8, 0.0);
+    expect_inside(-4.8, 0.0);
+    expect_inside(0.0, 8.4);
+    expect_inside(0.0, -8.4);
+  }
+}
+
+TEST_F(RollingSnapshotTest, ForwardOffsetRejectsNan) {
+  map_->setRollingWindowForwardOffset(5.0);
+  EXPECT_THROW(
+    map_->setRollingWindowForwardOffset(std::numeric_limits<double>::quiet_NaN()),
+    std::invalid_argument);
+
+  update(10.0, 10.0, 0.0);
+  const double actual_center_x =
+    map_->getCostmap()->getOriginX() + map_->getCostmap()->getSizeInMetersX() / 2.0;
+  EXPECT_NEAR(actual_center_x, 15.0, map_->getCostmap()->getResolution());
 }
 
 TEST_F(ObstacleDecaySnapshotTest, SnapshotParametersAreStartupOnly) {

@@ -40,6 +40,7 @@
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
@@ -114,6 +115,7 @@ Costmap2DROS::Costmap2DROS(const std::string& name,
                     rclcpp::ParameterValue(std::string("base_link")));
   declare_parameter("robot_radius", rclcpp::ParameterValue(0.1));
   declare_parameter("rolling_window", rclcpp::ParameterValue(false));
+  declare_parameter("rolling_window_forward_offset", rclcpp::ParameterValue(0.0));
   declare_parameter("track_unknown_space", rclcpp::ParameterValue(false));
   declare_parameter("transform_tolerance", rclcpp::ParameterValue(0.3));
   declare_parameter("trinary_costmap", rclcpp::ParameterValue(true));
@@ -132,12 +134,18 @@ nav2_util::CallbackReturn Costmap2DROS::on_configure(
   RCLCPP_INFO(get_logger(), "Configuring");
   getParameters();
 
+  if (!std::isfinite(rolling_window_forward_offset_)) {
+    RCLCPP_ERROR(get_logger(), "rolling_window_forward_offset must be finite");
+    return nav2_util::CallbackReturn::FAILURE;
+  }
+
   callback_group_ = create_callback_group(
       rclcpp::CallbackGroupType::MutuallyExclusive, false);
 
   // Create the costmap itself
   layered_costmap_ = std::make_unique<LayeredCostmap>(
       global_frame_, rolling_window_, track_unknown_space_);
+  layered_costmap_->setRollingWindowForwardOffset(rolling_window_forward_offset_);
 
   if (!layered_costmap_->isSizeLocked()) {
     layered_costmap_->resizeMap(
@@ -336,6 +344,7 @@ void Costmap2DROS::getParameters() {
   get_parameter("robot_base_frame", robot_base_frame_);
   get_parameter("robot_radius", robot_radius_);
   get_parameter("rolling_window", rolling_window_);
+  get_parameter("rolling_window_forward_offset", rolling_window_forward_offset_);
   get_parameter("track_unknown_space", track_unknown_space_);
   get_parameter("transform_tolerance", transform_tolerance_);
   get_parameter("update_frequency", map_update_frequency_);
@@ -640,6 +649,15 @@ Costmap2DROS::dynamicParametersCallback(
       } else if (name == "origin_y") {
         resize_map = true;
         origin_y_ = parameter.as_double();
+      } else if (name == "rolling_window_forward_offset") {
+        if (!std::isfinite(parameter.as_double())) {
+          result.successful = false;
+          result.reason = "rolling_window_forward_offset must be finite";
+          return result;
+        }
+        rolling_window_forward_offset_ = parameter.as_double();
+        layered_costmap_->setRollingWindowForwardOffset(
+          rolling_window_forward_offset_);
       }
     } else if (type == ParameterType::PARAMETER_INTEGER) {
       if (name == "width") {

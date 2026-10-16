@@ -362,6 +362,7 @@ protected:
   std::string robot_base_frame_;   ///< The frame_id of the robot base
   double robot_radius_;
   bool rolling_window_{false};     ///< Whether to use a rolling window version of the costmap
+  double rolling_window_forward_offset_{0.0};
   bool track_unknown_space_{false};
   double transform_tolerance_{0};  ///< The timeout before transform errors
 

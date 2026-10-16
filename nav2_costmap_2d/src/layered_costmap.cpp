@@ -38,8 +38,10 @@
 #include "nav2_costmap_2d/layered_costmap.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <limits>
@@ -129,6 +131,26 @@ bool LayeredCostmap::isOutofBounds(double robot_x, double robot_y)
   return !combined_costmap_.worldToMap(robot_x, robot_y, mx, my);
 }
 
+void LayeredCostmap::setRollingWindowForwardOffset(double offset)
+{
+  if (!std::isfinite(offset)) {
+    throw std::invalid_argument("rolling_window_forward_offset must be finite");
+  }
+  std::unique_lock<Costmap2D::mutex_t> lock(*(combined_costmap_.getMutex()));
+  rolling_window_forward_offset_ = offset;
+}
+
+void LayeredCostmap::getRollingWindowOrigin(
+  double robot_x, double robot_y, double robot_yaw,
+  double & origin_x, double & origin_y) const
+{
+  std::unique_lock<Costmap2D::mutex_t> lock(*(combined_costmap_.getMutex()));
+  const double center_x = robot_x + rolling_window_forward_offset_ * std::cos(robot_yaw);
+  const double center_y = robot_y + rolling_window_forward_offset_ * std::sin(robot_yaw);
+  origin_x = center_x - combined_costmap_.getSizeInMetersX() / 2.0;
+  origin_y = center_y - combined_costmap_.getSizeInMetersY() / 2.0;
+}
+
 void LayeredCostmap::updateMap(double robot_x, double robot_y, double robot_yaw)
 {
   // Lock for the remainder of this function, some plugins (e.g. VoxelLayer)
@@ -138,8 +160,9 @@ void LayeredCostmap::updateMap(double robot_x, double robot_y, double robot_yaw)
   // if we're using a rolling buffer costmap...
   // we need to update the origin using the robot's position
   if (rolling_window_) {
-    double new_origin_x = robot_x - combined_costmap_.getSizeInMetersX() / 2;
-    double new_origin_y = robot_y - combined_costmap_.getSizeInMetersY() / 2;
+    double new_origin_x = 0.0;
+    double new_origin_y = 0.0;
+    getRollingWindowOrigin(robot_x, robot_y, robot_yaw, new_origin_x, new_origin_y);
     primary_costmap_.updateOrigin(new_origin_x, new_origin_y);
     combined_costmap_.updateOrigin(new_origin_x, new_origin_y);
   }

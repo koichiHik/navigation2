@@ -73,6 +73,25 @@ public:
    */
   void updateMap(double robot_x, double robot_y, double robot_yaw);
 
+  /**
+   * @brief Set the forward offset of a rolling costmap from the robot.
+   * @param offset Distance from the robot to the rolling-window center, in meters
+   * @throws std::invalid_argument if offset is not finite
+   */
+  void setRollingWindowForwardOffset(double offset);
+
+  /**
+   * @brief Calculate the requested rolling-window origin for a robot pose.
+   * @param robot_x Robot x position in the global frame
+   * @param robot_y Robot y position in the global frame
+   * @param robot_yaw Robot heading in the global frame
+   * @param origin_x Requested lower-left x origin
+   * @param origin_y Requested lower-left y origin
+   */
+  void getRollingWindowOrigin(
+    double robot_x, double robot_y, double robot_yaw,
+    double & origin_x, double & origin_y) const;
+
   std::string getGlobalFrameID() const
   {
     return global_frame_;
@@ -218,6 +237,7 @@ private:
   std::string global_frame_;
 
   bool rolling_window_;  /// < @brief Whether or not the costmap should roll with the robot
+  double rolling_window_forward_offset_{0.0};
 
   bool current_;
   double minx_, miny_, maxx_, maxy_;
