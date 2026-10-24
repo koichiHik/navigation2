@@ -15,6 +15,7 @@
 #include "nav2_collision_monitor/collision_monitor_node.hpp"
 
 #include <exception>
+#include <cmath>
 #include <utility>
 #include <functional>
 
@@ -406,7 +407,15 @@ bool CollisionMonitor::processStopSlowdown(
       robot_action.req_vel.tw = 0.0;
       return true;
     } else {  // SLOWDOWN
-      const Velocity safe_vel = velocity * polygon->getSlowdownRatio();
+      double slowdown_ratio = polygon->getSlowdownRatio();
+      if (polygon->hasLinearLimit()) {
+        // Scale all components together to preserve the commanded curvature.
+        // A linear cap leaves already slow commands and pure rotation unchanged.
+        const double linear_speed = std::hypot(velocity.x, velocity.y);
+        slowdown_ratio = linear_speed > polygon->getLinearLimit() ?
+          polygon->getLinearLimit() / linear_speed : 1.0;
+      }
+      const Velocity safe_vel = velocity * slowdown_ratio;
       // Check that currently calculated velocity is safer than
       // chosen for previous shapes one
       if (safe_vel < robot_action.req_vel) {
@@ -455,11 +464,18 @@ void CollisionMonitor::printAction(
       "Robot to stop due to %s polygon",
       action_polygon->getName().c_str());
   } else if (robot_action.action_type == SLOWDOWN) {
-    RCLCPP_INFO(
-      get_logger(),
-      "Robot to slowdown for %f percents due to %s polygon",
-      action_polygon->getSlowdownRatio() * 100,
-      action_polygon->getName().c_str());
+    if (action_polygon->hasLinearLimit()) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Robot linear speed limited to %f m/s due to %s polygon",
+        action_polygon->getLinearLimit(), action_polygon->getName().c_str());
+    } else {
+      RCLCPP_INFO(
+        get_logger(),
+        "Robot to slowdown for %f percents due to %s polygon",
+        action_polygon->getSlowdownRatio() * 100,
+        action_polygon->getName().c_str());
+    }
   } else if (robot_action.action_type == APPROACH) {
     RCLCPP_INFO(
       get_logger(),

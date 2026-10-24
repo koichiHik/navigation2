@@ -372,6 +372,47 @@ TEST_F(Tester, testPolygonGetSlowdownParameters)
   EXPECT_EQ(polygon_->isVisualize(), true);
   // Check that slowdown_ratio is correct
   EXPECT_NEAR(polygon_->getSlowdownRatio(), SLOWDOWN_RATIO, EPSILON);
+  EXPECT_FALSE(polygon_->hasLinearLimit());
+}
+
+TEST_F(Tester, testPolygonGetLinearLimit)
+{
+  test_node_->declare_parameter(
+    std::string(POLYGON_NAME) + ".linear_limit", rclcpp::ParameterValue(0.2));
+  createPolygon("slowdown");
+
+  EXPECT_TRUE(polygon_->hasLinearLimit());
+  EXPECT_DOUBLE_EQ(polygon_->getLinearLimit(), 0.2);
+}
+
+TEST_F(Tester, testPolygonRejectInvalidLinearLimit)
+{
+  const std::vector<double> invalid_limits{
+    0.0, -0.2, std::numeric_limits<double>::infinity(),
+    -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()};
+  for (std::size_t i = 0; i < invalid_limits.size(); ++i) {
+    const std::string name = "InvalidLimit" + std::to_string(i);
+    SCOPED_TRACE(name);
+    setCommonParameters(name, "slowdown");
+    test_node_->declare_parameter(name + ".points", rclcpp::ParameterValue(SQUARE_POLYGON));
+    test_node_->declare_parameter(
+      name + ".linear_limit", rclcpp::ParameterValue(invalid_limits[i]));
+
+    PolygonWrapper polygon(test_node_, name, tf_buffer_, BASE_FRAME_ID, TRANSFORM_TOLERANCE);
+    EXPECT_FALSE(polygon.configure());
+  }
+}
+
+TEST_F(Tester, testPolygonRejectWrongLinearLimitType)
+{
+  test_node_->declare_parameter(
+    std::string(POLYGON_NAME) + ".linear_limit", rclcpp::ParameterValue("0.2"));
+  setCommonParameters(POLYGON_NAME, "slowdown");
+  setPolygonParameters(SQUARE_POLYGON);
+
+  polygon_ = std::make_shared<PolygonWrapper>(
+    test_node_, POLYGON_NAME, tf_buffer_, BASE_FRAME_ID, TRANSFORM_TOLERANCE);
+  EXPECT_FALSE(polygon_->configure());
 }
 
 TEST_F(Tester, testPolygonGetApproachParameters)

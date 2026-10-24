@@ -15,6 +15,7 @@
 #include "nav2_collision_monitor/polygon.hpp"
 
 #include <exception>
+#include <cmath>
 #include <utility>
 
 #include "geometry_msgs/msg/point.hpp"
@@ -34,7 +35,8 @@ Polygon::Polygon(
   const std::string & base_frame_id,
   const tf2::Duration & transform_tolerance)
 : node_(node), polygon_name_(polygon_name), action_type_(DO_NOTHING),
-  slowdown_ratio_(0.0), footprint_sub_(nullptr), tf_buffer_(tf_buffer),
+  slowdown_ratio_(0.0), has_linear_limit_(false), linear_limit_(0.0),
+  footprint_sub_(nullptr), tf_buffer_(tf_buffer),
   base_frame_id_(base_frame_id), transform_tolerance_(transform_tolerance)
 {
   RCLCPP_INFO(logger_, "[%s]: Creating Polygon", polygon_name_.c_str());
@@ -117,6 +119,16 @@ int Polygon::getMaxPoints() const
 double Polygon::getSlowdownRatio() const
 {
   return slowdown_ratio_;
+}
+
+bool Polygon::hasLinearLimit() const
+{
+  return has_linear_limit_;
+}
+
+double Polygon::getLinearLimit() const
+{
+  return linear_limit_;
 }
 
 double Polygon::getTimeBeforeCollision() const
@@ -247,6 +259,17 @@ bool Polygon::getCommonParameters(std::string & polygon_pub_topic)
       nav2_util::declare_parameter_if_not_declared(
         node, polygon_name_ + ".slowdown_ratio", rclcpp::ParameterValue(0.5));
       slowdown_ratio_ = node->get_parameter(polygon_name_ + ".slowdown_ratio").as_double();
+
+      // A typed, unset parameter distinguishes omission from an explicitly invalid cap.
+      nav2_util::declare_parameter_if_not_declared(
+        node, polygon_name_ + ".linear_limit", rclcpp::PARAMETER_DOUBLE);
+      has_linear_limit_ = node->get_parameter(polygon_name_ + ".linear_limit", linear_limit_);
+      if (has_linear_limit_ && (!std::isfinite(linear_limit_) || linear_limit_ <= 0.0)) {
+        RCLCPP_ERROR(
+          logger_, "[%s]: linear_limit must be finite and greater than zero",
+          polygon_name_.c_str());
+        return false;
+      }
     }
 
     if (action_type_ == APPROACH) {

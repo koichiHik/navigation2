@@ -98,6 +98,15 @@ public:
    */
   double getSlowdownRatio() const;
   /**
+   * @brief Whether SLOWDOWN uses an absolute linear speed cap instead of a fixed ratio.
+   */
+  bool hasLinearLimit() const;
+  /**
+   * @brief Obtains the optional linear speed cap for SLOWDOWN, in m/s.
+   * Only meaningful when hasLinearLimit() is true.
+   */
+  double getLinearLimit() const;
+  /**
    * @brief Obtains required time before collision for current polygon.
    * Applicable for APPROACH model.
    * @return Time before collision in seconds
@@ -179,6 +188,10 @@ protected:
   int max_points_;
   /// @brief Robot slowdown (share of its actual speed)
   double slowdown_ratio_;
+  /// @brief Whether an absolute linear speed cap overrides the fixed slowdown ratio
+  bool has_linear_limit_;
+  /// @brief Optional absolute linear speed cap in m/s for SLOWDOWN
+  double linear_limit_;
   /// @brief Time before collision in seconds
   double time_before_collision_;
   /// @brief Time step for robot movement simulation

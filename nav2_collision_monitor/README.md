@@ -49,6 +49,34 @@ The following diagram is showing the high-level design of Collision Monitor modu
 
 Detailed configuration parameters, their description and how to setup a Collision Monitor could be found at its [Configuration Guide](https://navigation.ros.org/configuration/packages/configuring-collision-monitor.html) and [Using Collision Monitor tutorial](https://navigation.ros.org/tutorials/docs/using_collision_monitor.html) pages.
 
+### Local Humble extension: absolute linear speed cap
+
+For a `slowdown` polygon or circle, this repository adds an optional `linear_limit`
+parameter in m/s. It must be a finite, strictly positive double. When the obstacle
+point threshold is exceeded, the cap replaces `slowdown_ratio`:
+
+```yaml
+NearSlow:
+  type: "polygon"
+  points: [1.2, 0.6, 1.2, -0.6, -0.6, -0.6, -0.6, 0.6]
+  action_type: "slowdown"
+  max_points: 0
+  linear_limit: 0.3
+```
+
+If `hypot(vx, vy)` exceeds the cap, all three planar command components
+`vx`, `vy`, and `wz` are scaled by `linear_limit / hypot(vx, vy)` to preserve
+commanded curvature. Commands already at or below the cap pass unchanged,
+including zero and pure rotation; this option does not impose an angular speed
+limit. Multiple triggered zones select the most restrictive candidate from the
+original input, rather than applying caps cumulatively. Without `linear_limit`,
+the upstream fixed `slowdown_ratio` behavior is unchanged.
+
+This is a repository-specific extension of Humble 1.1.8, not the later upstream
+`limit` action. It does not change `stop`, `approach`, source timeout, or lifecycle
+behavior. Parameters are read during configuration; restart or reconfigure the
+node after changing them.
+
 
 ## Metrics
 
