@@ -86,6 +86,7 @@ add_library(layers SHARED
   plugins/static_layer.cpp
   plugins/obstacle_layer.cpp
   plugins/obstacle_decay_layer.cpp
+  plugins/region_aware_decay_layer.cpp
   src/observation_buffer.cpp
   src/observation_buffer_with_base.cpp
   plugins/voxel_layer.cpp

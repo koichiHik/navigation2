@@ -60,3 +60,8 @@ ament_add_gtest(obstacle_decay_freshness_test obstacle_decay_freshness_test.cpp)
 target_link_libraries(obstacle_decay_freshness_test
   nav2_costmap_2d_core layers
 )
+
+ament_add_gtest(region_aware_decay_layer_test region_aware_decay_layer_test.cpp)
+target_link_libraries(region_aware_decay_layer_test
+  nav2_costmap_2d_core layers
+)
