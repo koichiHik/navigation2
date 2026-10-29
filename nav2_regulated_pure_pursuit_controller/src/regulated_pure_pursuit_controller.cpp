@@ -14,7 +14,9 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <cmath>
 #include <string>
+#include <stdexcept>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -37,6 +39,14 @@ using rcl_interfaces::msg::ParameterType;
 
 namespace nav2_regulated_pure_pursuit_controller
 {
+
+namespace
+{
+bool isValidMaxAngularVel(double value)
+{
+  return value == -1.0 || (std::isfinite(value) && value > 0.0);
+}
+}  // namespace
 
 void RegulatedPurePursuitController::configure(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
@@ -62,6 +72,8 @@ void RegulatedPurePursuitController::configure(
 
   declare_parameter_if_not_declared(
     node, plugin_name_ + ".desired_linear_vel", rclcpp::ParameterValue(0.5));
+  declare_parameter_if_not_declared(
+    node, plugin_name_ + ".max_angular_vel", rclcpp::ParameterValue(-1.0));
   declare_parameter_if_not_declared(
     node, plugin_name_ + ".lookahead_dist", rclcpp::ParameterValue(0.6));
   declare_parameter_if_not_declared(
@@ -120,6 +132,11 @@ void RegulatedPurePursuitController::configure(
 
   node->get_parameter(plugin_name_ + ".desired_linear_vel", desired_linear_vel_);
   base_desired_linear_vel_ = desired_linear_vel_;
+  node->get_parameter(plugin_name_ + ".max_angular_vel", max_angular_vel_);
+  if (!isValidMaxAngularVel(max_angular_vel_)) {
+    throw std::invalid_argument(
+            plugin_name_ + ".max_angular_vel must be -1.0 (disabled) or a finite positive value");
+  }
   node->get_parameter(plugin_name_ + ".lookahead_dist", lookahead_dist_);
   node->get_parameter(plugin_name_ + ".min_lookahead_dist", min_lookahead_dist_);
   node->get_parameter(plugin_name_ + ".max_lookahead_dist", max_lookahead_dist_);
@@ -348,6 +365,15 @@ geometry_msgs::msg::TwistStamped RegulatedPurePursuitController::computeVelocity
 
     // Apply curvature to angular velocity after constraining linear velocity
     angular_vel = linear_vel * curvature;
+  }
+
+  // Preserve curvature while limiting both tracking and rotate-to-heading commands.
+  // The hard angular limit takes precedence over minimum speeds and angular acceleration.
+  const double angular_speed = std::abs(angular_vel);
+  if (max_angular_vel_ > 0.0 && angular_speed > max_angular_vel_) {
+    const double scale = max_angular_vel_ / angular_speed;
+    linear_vel *= scale;
+    angular_vel = std::copysign(max_angular_vel_, angular_vel);
   }
 
   // Collision checking on this velocity heading
@@ -820,6 +846,19 @@ RegulatedPurePursuitController::dynamicParametersCallback(
   rcl_interfaces::msg::SetParametersResult result;
   std::lock_guard<std::mutex> lock_reinit(mutex_);
 
+  // Reject invalid limits before mutating any members in an atomic parameter update.
+  for (const auto & parameter : parameters) {
+    if (parameter.get_name() == plugin_name_ + ".max_angular_vel" &&
+      (parameter.get_type() != ParameterType::PARAMETER_DOUBLE ||
+      !isValidMaxAngularVel(parameter.as_double())))
+    {
+      result.successful = false;
+      result.reason =
+        plugin_name_ + ".max_angular_vel must be -1.0 (disabled) or a finite positive double";
+      return result;
+    }
+  }
+
   for (auto parameter : parameters) {
     const auto & type = parameter.get_type();
     const auto & name = parameter.get_name();
@@ -836,6 +875,8 @@ RegulatedPurePursuitController::dynamicParametersCallback(
       } else if (name == plugin_name_ + ".desired_linear_vel") {
         desired_linear_vel_ = parameter.as_double();
         base_desired_linear_vel_ = parameter.as_double();
+      } else if (name == plugin_name_ + ".max_angular_vel") {
+        max_angular_vel_ = parameter.as_double();
       } else if (name == plugin_name_ + ".lookahead_dist") {
         lookahead_dist_ = parameter.as_double();
       } else if (name == plugin_name_ + ".max_lookahead_dist") {

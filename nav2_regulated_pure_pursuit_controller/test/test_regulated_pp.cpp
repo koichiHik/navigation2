@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 #include <limits>
+#include <stdexcept>
 
 #include "gtest/gtest.h"
 #include "rclcpp/rclcpp.hpp"
@@ -26,6 +27,7 @@
 #include "nav2_regulated_pure_pursuit_controller/regulated_pure_pursuit_controller.hpp"
 #include "nav2_costmap_2d/costmap_filters/filter_values.hpp"
 #include "nav2_core/exceptions.hpp"
+#include "nav2_core/goal_checker.hpp"
 
 class RclCppFixture
 {
@@ -44,6 +46,12 @@ public:
   nav_msgs::msg::Path getPlan() {return global_plan_;}
 
   double getSpeed() {return desired_linear_vel_;}
+
+  rcl_interfaces::msg::SetParametersResult updateParameters(
+    const std::vector<rclcpp::Parameter> & parameters)
+  {
+    return dynamicParametersCallback(parameters);
+  }
 
   std::unique_ptr<geometry_msgs::msg::PointStamped> createCarrotMsgWrapper(
     const geometry_msgs::msg::PoseStamped & carrot_pose)
@@ -988,4 +996,249 @@ TEST_F(TransformGlobalPlanTest, prune_after_leaving_costmap)
   EXPECT_NEAR(transformed_plan.poses.size(), 10u, 1);
   EXPECT_NEAR(transformed_plan.poses[0].pose.position.x, 0.0, 0.5);
   EXPECT_NEAR(transformed_plan.poses[0].pose.position.y, 0.0, 0.5);
+}
+
+class AngularLimitGoalChecker : public nav2_core::GoalChecker
+{
+public:
+  void initialize(
+    const rclcpp_lifecycle::LifecycleNode::WeakPtr &, const std::string &,
+    const std::shared_ptr<nav2_costmap_2d::Costmap2DROS>) override {}
+  void reset() override {}
+  bool isGoalReached(
+    const geometry_msgs::msg::Pose &, const geometry_msgs::msg::Pose &,
+    const geometry_msgs::msg::Twist &) override {return false;}
+  bool getTolerances(
+    geometry_msgs::msg::Pose & pose_tolerance, geometry_msgs::msg::Twist &) override
+  {
+    pose_tolerance.position.x = 0.1;
+    return true;
+  }
+};
+
+class AngularVelocityLimitTest : public ::testing::Test
+{
+protected:
+  void SetUp() override
+  {
+    node_ = std::make_shared<rclcpp_lifecycle::LifecycleNode>("angular_limit_test");
+    tf_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
+    costmap_ = std::make_shared<nav2_costmap_2d::Costmap2DROS>("angular_limit_costmap");
+    const auto results = costmap_->set_parameters(
+    {
+      rclcpp::Parameter("plugins", std::vector<std::string>{}),
+      rclcpp::Parameter("origin_x", -5.0),
+      rclcpp::Parameter("origin_y", -5.0),
+      rclcpp::Parameter("width", 10),
+      rclcpp::Parameter("height", 10),
+      rclcpp::Parameter("resolution", 0.05)});
+    for (const auto & result : results) {
+      ASSERT_TRUE(result.successful) << result.reason;
+    }
+    costmap_->on_configure(rclcpp_lifecycle::State());
+
+    for (const auto & parameter : std::vector<rclcpp::Parameter>{
+      rclcpp::Parameter("test_rpp.desired_linear_vel", 1.0),
+      rclcpp::Parameter("test_rpp.lookahead_dist", 0.6),
+      rclcpp::Parameter("test_rpp.transform_tolerance", 0.0),
+      rclcpp::Parameter("test_rpp.use_interpolation", false),
+      rclcpp::Parameter("test_rpp.use_velocity_scaled_lookahead_dist", false),
+      rclcpp::Parameter("test_rpp.use_rotate_to_heading", false),
+      rclcpp::Parameter("test_rpp.use_collision_detection", false),
+      rclcpp::Parameter("test_rpp.use_regulated_linear_velocity_scaling", false),
+      rclcpp::Parameter("test_rpp.use_cost_regulated_linear_velocity_scaling", false),
+      rclcpp::Parameter("test_rpp.regulated_linear_scaling_min_speed", 0.1)})
+    {
+      node_->declare_parameter(parameter.get_name(), parameter.get_parameter_value());
+    }
+
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.frame_id = costmap_->getGlobalFrameID();
+    transform.child_frame_id = costmap_->getBaseFrameID();
+    transform.transform.rotation.w = 1.0;
+    ASSERT_TRUE(tf_->setTransform(transform, "angular_limit_test", true));
+    ctrl_ = std::make_shared<BasicAPIRPP>();
+    ctrl_->configure(node_, "test_rpp", tf_, costmap_);
+    ctrl_->activate();
+  }
+
+  void TearDown() override
+  {
+    if (ctrl_) {
+      ctrl_->deactivate();
+      ctrl_->cleanup();
+    }
+  }
+
+  void update(const std::vector<rclcpp::Parameter> & parameters)
+  {
+    const auto result = node_->set_parameters_atomically(parameters);
+    ASSERT_TRUE(result.successful) << result.reason;
+  }
+
+  geometry_msgs::msg::Twist command(
+    double carrot_x = 0.5, double carrot_y = 0.5, double current_angular_vel = 0.0)
+  {
+    geometry_msgs::msg::PoseStamped robot_pose;
+    robot_pose.header.frame_id = costmap_->getGlobalFrameID();
+    robot_pose.header.stamp = node_->now();
+    robot_pose.pose.orientation.w = 1.0;
+    nav_msgs::msg::Path path;
+    path.header = robot_pose.header;
+    path.poses.assign(3, robot_pose);
+    path.poses[1].pose.position.x = carrot_x;
+    path.poses[1].pose.position.y = carrot_y;
+    path.poses[2].pose.position.x = 3.0 * carrot_x;
+    path.poses[2].pose.position.y = 3.0 * carrot_y;
+    ctrl_->setPlan(path);
+    geometry_msgs::msg::Twist current_speed;
+    current_speed.angular.z = current_angular_vel;
+    return ctrl_->computeVelocityCommands(robot_pose, current_speed, &goal_checker_).twist;
+  }
+
+  std::shared_ptr<BasicAPIRPP> ctrl_;
+  std::shared_ptr<rclcpp_lifecycle::LifecycleNode> node_;
+  std::shared_ptr<tf2_ros::Buffer> tf_;
+  std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_;
+  AngularLimitGoalChecker goal_checker_;
+};
+
+TEST_F(AngularVelocityLimitTest, disabled_and_under_limit_preserve_commands)
+{
+  EXPECT_DOUBLE_EQ(node_->get_parameter("test_rpp.max_angular_vel").as_double(), -1.0);
+  auto twist = command();  // The carrot at (0.5, 0.5) has curvature 2 / m.
+  EXPECT_DOUBLE_EQ(twist.linear.x, 1.0);
+  EXPECT_DOUBLE_EQ(twist.angular.z, 2.0);
+
+  update({rclcpp::Parameter("test_rpp.max_angular_vel", 0.5)});
+  twist = command(1.0, 0.1);
+  EXPECT_DOUBLE_EQ(twist.linear.x, 1.0);
+  EXPECT_NEAR(twist.angular.z, 0.2 / 1.01, 1e-12);
+  twist = command(1.0, 0.0);
+  EXPECT_DOUBLE_EQ(twist.linear.x, 1.0);
+  EXPECT_DOUBLE_EQ(twist.angular.z, 0.0);
+}
+
+TEST_F(AngularVelocityLimitTest, preserves_curvature_for_both_speeds_and_directions)
+{
+  update(
+  {
+    rclcpp::Parameter("test_rpp.max_angular_vel", 0.5),
+    rclcpp::Parameter("test_rpp.allow_reversing", true)});
+  for (double desired_speed : {0.5, 1.0}) {
+    update({rclcpp::Parameter("test_rpp.desired_linear_vel", desired_speed)});
+    for (double direction : {-1.0, 1.0}) {
+      for (double turn : {-1.0, 1.0}) {
+        const auto twist = command(direction * 0.5, turn * 0.5);
+        EXPECT_DOUBLE_EQ(twist.linear.x, direction * 0.25);
+        EXPECT_DOUBLE_EQ(twist.angular.z, direction * turn * 0.5);
+        EXPECT_DOUBLE_EQ(twist.angular.z / twist.linear.x, turn * 2.0);
+      }
+    }
+  }
+}
+
+TEST_F(AngularVelocityLimitTest, angular_limit_takes_priority_over_minimum_linear_speed)
+{
+  update(
+  {
+    rclcpp::Parameter("test_rpp.use_regulated_linear_velocity_scaling", true),
+    rclcpp::Parameter("test_rpp.regulated_linear_scaling_min_radius", 100.0)});
+  auto twist = command();
+  EXPECT_NEAR(twist.linear.x, 0.1, 1e-12);
+  update({rclcpp::Parameter("test_rpp.max_angular_vel", 0.1)});
+  twist = command();
+  EXPECT_NEAR(twist.linear.x, 0.05, 1e-12);
+  EXPECT_DOUBLE_EQ(twist.angular.z, 0.1);
+}
+
+TEST_F(AngularVelocityLimitTest, limits_rotation_even_when_measured_speed_exceeds_limit)
+{
+  update(
+  {
+    rclcpp::Parameter("test_rpp.max_angular_vel", 0.5),
+    rclcpp::Parameter("test_rpp.use_rotate_to_heading", true)});
+  for (double direction : {-1.0, 1.0}) {
+    auto twist = command(0.1, direction, 0.0);
+    EXPECT_DOUBLE_EQ(twist.linear.x, 0.0);
+    EXPECT_NEAR(twist.angular.z, direction * 0.16, 1e-12);
+    twist = command(0.1, direction, direction * 1.7);
+    EXPECT_DOUBLE_EQ(twist.linear.x, 0.0);
+    EXPECT_DOUBLE_EQ(twist.angular.z, direction * 0.5);
+  }
+}
+
+TEST_F(AngularVelocityLimitTest, collision_check_uses_limited_commands)
+{
+  // The existing collision-detection switch is read during configuration only.
+  ctrl_->deactivate();
+  ctrl_->cleanup();
+  update({rclcpp::Parameter("test_rpp.use_collision_detection", true)});
+  ctrl_->configure(node_, "test_rpp", tf_, costmap_);
+  ctrl_->activate();
+  auto * map = costmap_->getCostmap();
+  unsigned int wall_x, wall_y;
+  ASSERT_TRUE(map->worldToMap(0.4, 0.0, wall_x, wall_y));
+  for (unsigned int y = 0; y < map->getSizeInCellsY(); ++y) {
+    map->setCost(wall_x, y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  }
+  EXPECT_THROW(command(), nav2_core::PlannerException);
+  update({rclcpp::Parameter("test_rpp.max_angular_vel", 0.2)});
+  EXPECT_NO_THROW(
+  {
+    const auto twist = command();
+    EXPECT_NEAR(twist.linear.x, 0.1, 1e-12);
+    EXPECT_DOUBLE_EQ(twist.angular.z, 0.2);
+  });
+}
+
+TEST_F(AngularVelocityLimitTest, dynamic_updates_change_effective_limit)
+{
+  update({rclcpp::Parameter("test_rpp.max_angular_vel", 1.0)});
+  EXPECT_DOUBLE_EQ(command().angular.z, 1.0);
+  update({rclcpp::Parameter("test_rpp.max_angular_vel", 0.25)});
+  const auto twist = command();
+  EXPECT_DOUBLE_EQ(twist.linear.x, 0.125);
+  EXPECT_DOUBLE_EQ(twist.angular.z, 0.25);
+  update({rclcpp::Parameter("test_rpp.max_angular_vel", -1.0)});
+  EXPECT_DOUBLE_EQ(command().angular.z, 2.0);
+}
+
+TEST_F(AngularVelocityLimitTest, rejects_invalid_updates_before_mutating_other_parameters)
+{
+  update({rclcpp::Parameter("test_rpp.max_angular_vel", 0.5)});
+  for (double invalid : {0.0, -0.5, -2.0, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()})
+  {
+    const auto result = node_->set_parameters_atomically(
+    {
+      rclcpp::Parameter("test_rpp.desired_linear_vel", 0.125),
+      rclcpp::Parameter("test_rpp.max_angular_vel", invalid)});
+    EXPECT_FALSE(result.successful);
+    EXPECT_FALSE(result.reason.empty());
+    EXPECT_DOUBLE_EQ(node_->get_parameter("test_rpp.desired_linear_vel").as_double(), 1.0);
+    EXPECT_DOUBLE_EQ(node_->get_parameter("test_rpp.max_angular_vel").as_double(), 0.5);
+    EXPECT_DOUBLE_EQ(ctrl_->getSpeed(), 1.0);
+    EXPECT_DOUBLE_EQ(command().angular.z, 0.5);
+  }
+  // Exercise the callback's type validation independently of ROS parameter type checks.
+  const auto result = ctrl_->updateParameters(
+  {
+    rclcpp::Parameter("test_rpp.desired_linear_vel", 0.125),
+    rclcpp::Parameter("test_rpp.max_angular_vel", 1)});
+  EXPECT_FALSE(result.successful);
+  EXPECT_DOUBLE_EQ(ctrl_->getSpeed(), 1.0);
+  EXPECT_DOUBLE_EQ(command().angular.z, 0.5);
+}
+
+TEST_F(AngularVelocityLimitTest, rejects_invalid_initial_limits)
+{
+  for (double invalid : {0.0, -0.5, -2.0, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()})
+  {
+    auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("invalid_angular_limit");
+    node->declare_parameter("test_rpp.max_angular_vel", invalid);
+    BasicAPIRPP controller;
+    EXPECT_THROW(controller.configure(node, "test_rpp", tf_, costmap_), std::invalid_argument);
+  }
 }

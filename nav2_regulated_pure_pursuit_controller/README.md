@@ -53,6 +53,7 @@ Note: The maximum allowed time to collision is thresholded by the lookahead poin
 | Parameter | Description | 
 |-----|----|
 | `desired_linear_vel` | The desired maximum linear velocity to use. | 
+| `max_angular_vel` | Maximum absolute commanded angular velocity (rad/s) during tracking and rotation to heading. Defaults to `-1.0` (disabled); otherwise requires a finite positive value. |
 | `lookahead_dist` | The lookahead distance to use to find the lookahead point | 
 | `min_lookahead_dist` | The minimum lookahead distance threshold when using velocity scaled lookahead distances | 
 | `max_lookahead_dist` | The maximum lookahead distance threshold when using velocity scaled lookahead distances | 
@@ -76,6 +77,8 @@ Note: The maximum allowed time to collision is thresholded by the lookahead poin
 | `max_angular_accel` | Maximum allowable angular acceleration while rotating to heading, if enabled | 
 | `max_robot_pose_search_dist` | Maximum integrated distance along the path to bound the search for the closest pose to the robot. This is set by default to the maximum costmap extent, so it shouldn't be set manually unless there are loops within the local costmap. | 
 | `use_interpolation` | Enables interpolation between poses on the path for lookahead point selection. Helps sparse paths to avoid inducing discontinuous commanded velocities. Set this to false for a potential performance boost, at the expense of smooth control. | 
+
+When `max_angular_vel` is enabled, commands exceeding the limit have their linear and angular velocities reduced by the same factor before collision checking. This preserves the commanded curvature and reversing direction. The angular limit takes precedence over minimum linear speeds and, when the current angular speed is already outside the limit, rotation-to-heading angular acceleration limits. It bounds commanded angular speed, not measured speed or tracking angular acceleration. The limit supports dynamic updates; invalid values are rejected.
 
 Example fully-described XML with default parameter values:
 
@@ -103,6 +106,7 @@ controller_server:
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
       desired_linear_vel: 0.5
+      max_angular_vel: -1.0
       lookahead_dist: 0.6
       min_lookahead_dist: 0.3
       max_lookahead_dist: 0.9
