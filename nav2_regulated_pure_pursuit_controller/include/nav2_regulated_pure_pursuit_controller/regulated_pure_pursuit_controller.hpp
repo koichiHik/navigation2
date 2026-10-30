@@ -24,6 +24,7 @@
 
 #include "nav2_costmap_2d/footprint_collision_checker.hpp"
 #include "nav2_core/controller.hpp"
+#include "nav2_core/exceptions.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "pluginlib/class_loader.hpp"
 #include "pluginlib/class_list_macros.hpp"
@@ -33,6 +34,22 @@
 
 namespace nav2_regulated_pure_pursuit_controller
 {
+
+class CollisionDetected : public nav2_core::PlannerException
+{
+public:
+  using nav2_core::PlannerException::PlannerException;
+};
+
+/** A candidate command and its debug data; evaluating it does not adopt the plan. */
+struct VelocityCommandEvaluation
+{
+  geometry_msgs::msg::TwistStamped command;
+  bool collision_detected{false};
+  nav_msgs::msg::Path transformed_plan;
+  geometry_msgs::msg::PointStamped carrot;
+  nav_msgs::msg::Path collision_arc;
+};
 
 /**
  * @class nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
@@ -94,6 +111,15 @@ public:
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & velocity,
     nav2_core::GoalChecker * /*goal_checker*/) override;
+
+  /** Evaluate an absolute speed limit and plan without changing controller state or publishing. */
+  VelocityCommandEvaluation evaluateVelocityCommands(
+    const nav_msgs::msg::Path & plan, double speed_limit,
+    const geometry_msgs::msg::PoseStamped & pose,
+    const geometry_msgs::msg::Twist & speed, nav2_core::GoalChecker * goal_checker);
+
+  /** Publish debug data for the adopted candidate without computing it again. */
+  void publishEvaluation(const VelocityCommandEvaluation & evaluation);
 
   /**
    * @brief nav2_core setPlan - Sets the global plan
@@ -189,6 +215,11 @@ protected:
     const double &, const double &,
     const double &);
 
+  bool checkCollision(
+    const geometry_msgs::msg::PoseStamped & robot_pose,
+    const double & linear_vel, const double & angular_vel, const double & carrot_dist,
+    nav_msgs::msg::Path & collision_arc);
+
   /**
    * @brief checks for collision at projected pose
    * @param x Pose of pose x
@@ -229,6 +260,22 @@ protected:
     const double & curvature, const geometry_msgs::msg::Twist & speed,
     const double & pose_cost, const nav_msgs::msg::Path & path,
     double & linear_vel, double & sign);
+
+  void applyConstraints(
+    const double & curvature, const geometry_msgs::msg::Twist & speed,
+    const double & pose_cost, const nav_msgs::msg::Path & path,
+    double & linear_vel, double & sign, double desired_linear_vel);
+
+  VelocityCommandEvaluation evaluateTransformedPlan(
+    const nav_msgs::msg::Path & transformed_plan,
+    const geometry_msgs::msg::PoseStamped & pose,
+    const geometry_msgs::msg::Twist & speed, double desired_linear_vel,
+    double goal_dist_tol);
+
+  double goalDistanceTolerance(nav2_core::GoalChecker * goal_checker);
+
+  nav_msgs::msg::Path transformPlan(
+    nav_msgs::msg::Path & plan, const geometry_msgs::msg::PoseStamped & pose);
 
   /**
    * @brief Find the intersection a circle and a line segment.

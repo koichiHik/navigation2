@@ -47,6 +47,8 @@ public:
 
   double getSpeed() {return desired_linear_vel_;}
 
+  double getGoalTolerance() {return goal_dist_tol_;}
+
   rcl_interfaces::msg::SetParametersResult updateParameters(
     const std::vector<rclcpp::Parameter> & parameters)
   {
@@ -1011,9 +1013,11 @@ public:
   bool getTolerances(
     geometry_msgs::msg::Pose & pose_tolerance, geometry_msgs::msg::Twist &) override
   {
-    pose_tolerance.position.x = 0.1;
+    pose_tolerance.position.x = tolerance;
     return true;
   }
+
+  double tolerance{0.1};
 };
 
 class AngularVelocityLimitTest : public ::testing::Test
@@ -1240,5 +1244,146 @@ TEST_F(AngularVelocityLimitTest, rejects_invalid_initial_limits)
     node->declare_parameter("test_rpp.max_angular_vel", invalid);
     BasicAPIRPP controller;
     EXPECT_THROW(controller.configure(node, "test_rpp", tf_, costmap_), std::invalid_argument);
+  }
+}
+
+class CandidateEvaluationTest : public AngularVelocityLimitTest
+{
+protected:
+  nav_msgs::msg::Path candidatePlan(double carrot_y = 0.5)
+  {
+    nav_msgs::msg::Path path;
+    path.header.frame_id = costmap_->getGlobalFrameID();
+    path.header.stamp = node_->now();
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.orientation.w = 1.0;
+    path.poses.assign(4, pose);
+    path.poses[0].pose.position.x = -0.3;  // Would be pruned by the regular entry point.
+    path.poses[2].pose.position.x = 0.5;
+    path.poses[2].pose.position.y = carrot_y;
+    path.poses[3].pose.position.x = 1.5;
+    path.poses[3].pose.position.y = 3.0 * carrot_y;
+    return path;
+  }
+};
+
+TEST_F(CandidateEvaluationTest, candidates_preserve_state_and_match_regular_commands)
+{
+  const auto plan = candidatePlan();
+  const auto robot_pose = plan.poses[1];
+  const geometry_msgs::msg::Twist speed;
+  ctrl_->setPlan(plan);
+  ctrl_->setSpeedLimit(0.7, false);
+  const double goal_tolerance = ctrl_->getGoalTolerance();
+  goal_checker_.tolerance = 0.02;
+
+  const auto normal = ctrl_->evaluateVelocityCommands(plan, 0.7, robot_pose, speed, &goal_checker_);
+  const auto avoidance = ctrl_->evaluateVelocityCommands(
+    candidatePlan(-0.5), 0.1, robot_pose, speed, &goal_checker_);
+  EXPECT_FALSE(normal.collision_detected);
+  EXPECT_FALSE(avoidance.collision_detected);
+  EXPECT_DOUBLE_EQ(normal.command.twist.linear.x, 0.7);
+  EXPECT_DOUBLE_EQ(avoidance.command.twist.linear.x, 0.1);
+  EXPECT_GT(normal.command.twist.angular.z, 0.0);
+  EXPECT_LT(avoidance.command.twist.angular.z, 0.0);
+  EXPECT_EQ(ctrl_->getPlan(), plan);
+  EXPECT_DOUBLE_EQ(ctrl_->getSpeed(), 0.7);
+  EXPECT_DOUBLE_EQ(ctrl_->getGoalTolerance(), goal_tolerance);
+  ASSERT_EQ(normal.transformed_plan.poses.size(), 3u);
+  EXPECT_EQ(plan.poses.size(), 4u);
+
+  const auto regular = ctrl_->computeVelocityCommands(robot_pose, speed, &goal_checker_);
+  EXPECT_EQ(regular, normal.command);
+  EXPECT_DOUBLE_EQ(ctrl_->getGoalTolerance(), 0.02);
+  EXPECT_EQ(ctrl_->getPlan().poses.size(), 3u);
+}
+
+TEST_F(CandidateEvaluationTest, errors_do_not_replace_the_adopted_plan_or_limits)
+{
+  const auto plan = candidatePlan();
+  ctrl_->setPlan(plan);
+  ctrl_->setSpeedLimit(0.7, false);
+  const auto tolerance = ctrl_->getGoalTolerance();
+  goal_checker_.tolerance = 0.02;
+  nav_msgs::msg::Path empty_plan;
+  EXPECT_THROW(
+    ctrl_->evaluateVelocityCommands(
+      empty_plan, 0.1, plan.poses[1], geometry_msgs::msg::Twist(), &goal_checker_),
+    nav2_core::PlannerException);
+  for (double invalid : {-0.1, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity()})
+  {
+    EXPECT_THROW(
+      ctrl_->evaluateVelocityCommands(
+        plan, invalid, plan.poses[1], geometry_msgs::msg::Twist(), &goal_checker_),
+      nav2_core::PlannerException);
+  }
+  EXPECT_EQ(ctrl_->getPlan(), plan);
+  EXPECT_DOUBLE_EQ(ctrl_->getSpeed(), 0.7);
+  EXPECT_DOUBLE_EQ(ctrl_->getGoalTolerance(), tolerance);
+}
+
+TEST_F(CandidateEvaluationTest, absolute_candidate_limits_include_zero_and_override_minimum_speeds)
+{
+  update(
+  {
+    rclcpp::Parameter("test_rpp.use_regulated_linear_velocity_scaling", true),
+    rclcpp::Parameter("test_rpp.regulated_linear_scaling_min_radius", 100.0),
+    rclcpp::Parameter("test_rpp.regulated_linear_scaling_min_speed", 0.25),
+    rclcpp::Parameter("test_rpp.min_approach_linear_velocity", 0.2)});
+  const auto plan = candidatePlan();
+  ctrl_->setPlan(plan);
+  ctrl_->setSpeedLimit(0.7, false);
+  const double tolerance = ctrl_->getGoalTolerance();
+  for (double limit : {0.0, 0.05, 0.1}) {
+    const auto result = ctrl_->evaluateVelocityCommands(
+      plan, limit, plan.poses[1], geometry_msgs::msg::Twist(), &goal_checker_);
+    EXPECT_DOUBLE_EQ(result.command.twist.linear.x, limit);
+    EXPECT_DOUBLE_EQ(result.command.twist.angular.z, 2.0 * limit);
+    EXPECT_EQ(ctrl_->getPlan(), plan);
+    EXPECT_DOUBLE_EQ(ctrl_->getSpeed(), 0.7);
+    EXPECT_DOUBLE_EQ(ctrl_->getGoalTolerance(), tolerance);
+  }
+  // The Nav2 setSpeedLimit entry point retains its existing sentinel semantics.
+  ctrl_->setSpeedLimit(nav2_costmap_2d::NO_SPEED_LIMIT, false);
+  EXPECT_DOUBLE_EQ(ctrl_->getSpeed(), 1.0);
+}
+
+TEST_F(CandidateEvaluationTest, collision_results_are_separate_from_other_errors)
+{
+  ctrl_->deactivate();
+  ctrl_->cleanup();
+  update({rclcpp::Parameter("test_rpp.use_collision_detection", true)});
+  ctrl_->configure(node_, "test_rpp", tf_, costmap_);
+  ctrl_->activate();
+  auto * map = costmap_->getCostmap();
+  unsigned int wall_x, wall_y;
+  ASSERT_TRUE(map->worldToMap(0.4, 0.0, wall_x, wall_y));
+  for (unsigned int y = 0; y < map->getSizeInCellsY(); ++y) {
+    map->setCost(wall_x, y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  }
+  const auto plan = candidatePlan(0.0);
+  const auto robot_pose = plan.poses[1];
+  const geometry_msgs::msg::Twist speed;
+  ctrl_->setPlan(plan);
+  const auto evaluation = ctrl_->evaluateVelocityCommands(
+    plan, 0.7, robot_pose, speed, &goal_checker_);
+  EXPECT_TRUE(evaluation.collision_detected);
+  EXPECT_EQ(ctrl_->getPlan(), plan);
+  EXPECT_FALSE(evaluation.collision_arc.poses.empty());
+  EXPECT_NO_THROW(ctrl_->publishEvaluation(evaluation));
+  EXPECT_THROW(
+    ctrl_->computeVelocityCommands(robot_pose, speed, &goal_checker_),
+    nav2_regulated_pure_pursuit_controller::CollisionDetected);
+
+  try {
+    ctrl_->evaluateVelocityCommands(
+      nav_msgs::msg::Path(), 0.7, robot_pose, speed, &goal_checker_);
+    FAIL() << "An empty plan must fail";
+  } catch (const nav2_regulated_pure_pursuit_controller::CollisionDetected &) {
+    FAIL() << "An empty plan is not a collision";
+  } catch (const nav2_core::PlannerException &) {
+    SUCCEED();
   }
 }

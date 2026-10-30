@@ -299,17 +299,60 @@ geometry_msgs::msg::TwistStamped RegulatedPurePursuitController::computeVelocity
 {
   std::lock_guard<std::mutex> lock_reinit(mutex_);
 
+  goal_dist_tol_ = goalDistanceTolerance(goal_checker);
+  auto evaluation = evaluateTransformedPlan(
+    transformPlan(global_plan_, pose), pose, speed, desired_linear_vel_, goal_dist_tol_);
+  publishEvaluation(evaluation);
+  if (evaluation.collision_detected) {
+    throw CollisionDetected("RegulatedPurePursuitController detected collision ahead!");
+  }
+  return evaluation.command;
+}
+
+VelocityCommandEvaluation RegulatedPurePursuitController::evaluateVelocityCommands(
+  const nav_msgs::msg::Path & plan, double speed_limit,
+  const geometry_msgs::msg::PoseStamped & pose,
+  const geometry_msgs::msg::Twist & speed, nav2_core::GoalChecker * goal_checker)
+{
+  std::lock_guard<std::mutex> lock_reinit(mutex_);
+  if (!std::isfinite(speed_limit) || speed_limit < 0.0) {
+    throw nav2_core::PlannerException("Invalid candidate speed limit");
+  }
+  auto candidate_plan = plan;
+  return evaluateTransformedPlan(
+    transformPlan(candidate_plan, pose), pose, speed, speed_limit,
+    goalDistanceTolerance(goal_checker));
+}
+
+void RegulatedPurePursuitController::publishEvaluation(
+  const VelocityCommandEvaluation & evaluation)
+{
+  global_path_pub_->publish(evaluation.transformed_plan);
+  carrot_pub_->publish(evaluation.carrot);
+  if (!evaluation.collision_arc.header.frame_id.empty()) {
+    carrot_arc_pub_->publish(evaluation.collision_arc);
+  }
+}
+
+double RegulatedPurePursuitController::goalDistanceTolerance(nav2_core::GoalChecker * goal_checker)
+{
   // Update for the current goal checker's state
   geometry_msgs::msg::Pose pose_tolerance;
   geometry_msgs::msg::Twist vel_tolerance;
-  if (!goal_checker->getTolerances(pose_tolerance, vel_tolerance)) {
+  if (!goal_checker || !goal_checker->getTolerances(pose_tolerance, vel_tolerance)) {
     RCLCPP_WARN(logger_, "Unable to retrieve goal checker's tolerances!");
-  } else {
-    goal_dist_tol_ = pose_tolerance.position.x;
+    return goal_dist_tol_;
   }
+  return pose_tolerance.position.x;
+}
 
-  // Transform path to robot base frame
-  auto transformed_plan = transformGlobalPlan(pose);
+VelocityCommandEvaluation RegulatedPurePursuitController::evaluateTransformedPlan(
+  const nav_msgs::msg::Path & transformed_plan,
+  const geometry_msgs::msg::PoseStamped & pose,
+  const geometry_msgs::msg::Twist & speed, double desired_linear_vel, double goal_dist_tol)
+{
+  VelocityCommandEvaluation evaluation;
+  evaluation.transformed_plan = transformed_plan;
 
   // Find look ahead distance and point on path and publish
   double lookahead_dist = getLookAheadDistance(speed);
@@ -326,7 +369,7 @@ geometry_msgs::msg::TwistStamped RegulatedPurePursuitController::computeVelocity
   }
 
   auto carrot_pose = getLookAheadPoint(lookahead_dist, transformed_plan);
-  carrot_pub_->publish(createCarrotMsg(carrot_pose));
+  evaluation.carrot = *createCarrotMsg(carrot_pose);
 
   double linear_vel, angular_vel;
 
@@ -348,11 +391,13 @@ geometry_msgs::msg::TwistStamped RegulatedPurePursuitController::computeVelocity
     sign = carrot_pose.pose.position.x >= 0.0 ? 1.0 : -1.0;
   }
 
-  linear_vel = desired_linear_vel_;
+  linear_vel = desired_linear_vel;
 
   // Make sure we're in compliance with basic constraints
   double angle_to_heading;
-  if (shouldRotateToGoalHeading(carrot_pose)) {
+  if (use_rotate_to_heading_ &&
+    std::hypot(carrot_pose.pose.position.x, carrot_pose.pose.position.y) < goal_dist_tol)
+  {
     double angle_to_goal = tf2::getYaw(transformed_plan.poses.back().pose.orientation);
     rotateToHeading(linear_vel, angular_vel, angle_to_goal, speed);
   } else if (shouldRotateToPath(carrot_pose, angle_to_heading)) {
@@ -361,7 +406,7 @@ geometry_msgs::msg::TwistStamped RegulatedPurePursuitController::computeVelocity
     applyConstraints(
       curvature, speed,
       costAtPose(pose.pose.position.x, pose.pose.position.y), transformed_plan,
-      linear_vel, sign);
+      linear_vel, sign, desired_linear_vel);
 
     // Apply curvature to angular velocity after constraining linear velocity
     angular_vel = linear_vel * curvature;
@@ -378,16 +423,16 @@ geometry_msgs::msg::TwistStamped RegulatedPurePursuitController::computeVelocity
 
   // Collision checking on this velocity heading
   const double & carrot_dist = hypot(carrot_pose.pose.position.x, carrot_pose.pose.position.y);
-  if (use_collision_detection_ && isCollisionImminent(pose, linear_vel, angular_vel, carrot_dist)) {
-    throw nav2_core::PlannerException("RegulatedPurePursuitController detected collision ahead!");
+  if (use_collision_detection_) {
+    evaluation.collision_detected = checkCollision(
+      pose, linear_vel, angular_vel, carrot_dist, evaluation.collision_arc);
   }
 
   // populate and return message
-  geometry_msgs::msg::TwistStamped cmd_vel;
-  cmd_vel.header = pose.header;
-  cmd_vel.twist.linear.x = linear_vel;
-  cmd_vel.twist.angular.z = angular_vel;
-  return cmd_vel;
+  evaluation.command.header = pose.header;
+  evaluation.command.twist.linear.x = linear_vel;
+  evaluation.command.twist.angular.z = angular_vel;
+  return evaluation;
 }
 
 bool RegulatedPurePursuitController::shouldRotateToPath(
@@ -494,6 +539,20 @@ bool RegulatedPurePursuitController::isCollisionImminent(
   const double & linear_vel, const double & angular_vel,
   const double & carrot_dist)
 {
+  nav_msgs::msg::Path collision_arc;
+  const bool collision = checkCollision(
+    robot_pose, linear_vel, angular_vel, carrot_dist, collision_arc);
+  if (!collision_arc.header.frame_id.empty()) {
+    carrot_arc_pub_->publish(collision_arc);
+  }
+  return collision;
+}
+
+bool RegulatedPurePursuitController::checkCollision(
+  const geometry_msgs::msg::PoseStamped & robot_pose,
+  const double & linear_vel, const double & angular_vel, const double & carrot_dist,
+  nav_msgs::msg::Path & arc_pts_msg)
+{
   // Note(stevemacenski): This may be a bit unusual, but the robot_pose is in
   // odom frame and the carrot_pose is in robot base frame.
 
@@ -506,7 +565,6 @@ bool RegulatedPurePursuitController::isCollisionImminent(
   }
 
   // visualization messages
-  nav_msgs::msg::Path arc_pts_msg;
   arc_pts_msg.header.frame_id = costmap_ros_->getGlobalFrameID();
   arc_pts_msg.header.stamp = robot_pose.header.stamp;
   geometry_msgs::msg::PoseStamped pose_msg;
@@ -558,12 +616,9 @@ bool RegulatedPurePursuitController::isCollisionImminent(
 
     // check for collision at the projected pose
     if (inCollision(curr_pose.x, curr_pose.y, curr_pose.theta)) {
-      carrot_arc_pub_->publish(arc_pts_msg);
       return true;
     }
   }
-
-  carrot_arc_pub_->publish(arc_pts_msg);
 
   return false;
 }
@@ -651,8 +706,18 @@ void RegulatedPurePursuitController::applyApproachVelocityScaling(
 }
 
 void RegulatedPurePursuitController::applyConstraints(
-  const double & curvature, const geometry_msgs::msg::Twist & /*curr_speed*/,
+  const double & curvature, const geometry_msgs::msg::Twist & curr_speed,
   const double & pose_cost, const nav_msgs::msg::Path & path, double & linear_vel, double & sign)
+{
+  applyConstraints(
+    curvature, curr_speed, pose_cost, path,
+    linear_vel, sign, desired_linear_vel_);
+}
+
+void RegulatedPurePursuitController::applyConstraints(
+  const double & curvature, const geometry_msgs::msg::Twist & /*curr_speed*/,
+  const double & pose_cost, const nav_msgs::msg::Path & path,
+  double & linear_vel, double & sign, double desired_linear_vel)
 {
   double curvature_vel = linear_vel;
   double cost_vel = linear_vel;
@@ -685,7 +750,7 @@ void RegulatedPurePursuitController::applyConstraints(
   applyApproachVelocityScaling(path, linear_vel);
 
   // Limit linear velocities to be valid
-  linear_vel = std::clamp(fabs(linear_vel), 0.0, desired_linear_vel_);
+  linear_vel = std::clamp(fabs(linear_vel), 0.0, desired_linear_vel);
   linear_vel = sign * linear_vel;
 }
 
@@ -715,13 +780,21 @@ void RegulatedPurePursuitController::setSpeedLimit(
 nav_msgs::msg::Path RegulatedPurePursuitController::transformGlobalPlan(
   const geometry_msgs::msg::PoseStamped & pose)
 {
-  if (global_plan_.poses.empty()) {
+  auto transformed_plan = transformPlan(global_plan_, pose);
+  global_path_pub_->publish(transformed_plan);
+  return transformed_plan;
+}
+
+nav_msgs::msg::Path RegulatedPurePursuitController::transformPlan(
+  nav_msgs::msg::Path & plan, const geometry_msgs::msg::PoseStamped & pose)
+{
+  if (plan.poses.empty()) {
     throw nav2_core::PlannerException("Received plan with zero length");
   }
 
   // let's get the pose of the robot in the frame of the plan
   geometry_msgs::msg::PoseStamped robot_pose;
-  if (!transformPose(global_plan_.header.frame_id, pose, robot_pose)) {
+  if (!transformPose(plan.header.frame_id, pose, robot_pose)) {
     throw nav2_core::PlannerException("Unable to transform robot pose into global plan's frame");
   }
 
@@ -730,21 +803,21 @@ nav_msgs::msg::Path RegulatedPurePursuitController::transformGlobalPlan(
 
   auto closest_pose_upper_bound =
     nav2_util::geometry_utils::first_after_integrated_distance(
-    global_plan_.poses.begin(), global_plan_.poses.end(), max_robot_pose_search_dist_);
+    plan.poses.begin(), plan.poses.end(), max_robot_pose_search_dist_);
 
   // First find the closest pose on the path to the robot
   // bounded by when the path turns around (if it does) so we don't get a pose from a later
   // portion of the path
   auto transformation_begin =
     nav2_util::geometry_utils::min_by(
-    global_plan_.poses.begin(), closest_pose_upper_bound,
+    plan.poses.begin(), closest_pose_upper_bound,
     [&robot_pose](const geometry_msgs::msg::PoseStamped & ps) {
       return euclidean_distance(robot_pose, ps);
     });
 
   // Find points up to max_transform_dist so we only transform them.
   auto transformation_end = std::find_if(
-    transformation_begin, global_plan_.poses.end(),
+    transformation_begin, plan.poses.end(),
     [&](const auto & pose) {
       return euclidean_distance(pose, robot_pose) > max_costmap_extent;
     });
@@ -752,7 +825,7 @@ nav_msgs::msg::Path RegulatedPurePursuitController::transformGlobalPlan(
   // Lambda to transform a PoseStamped from global frame to local
   auto transformGlobalPoseToLocal = [&](const auto & global_plan_pose) {
       geometry_msgs::msg::PoseStamped stamped_pose, transformed_pose;
-      stamped_pose.header.frame_id = global_plan_.header.frame_id;
+      stamped_pose.header.frame_id = plan.header.frame_id;
       stamped_pose.header.stamp = robot_pose.header.stamp;
       stamped_pose.pose = global_plan_pose.pose;
       transformPose(costmap_ros_->getBaseFrameID(), stamped_pose, transformed_pose);
@@ -771,8 +844,7 @@ nav_msgs::msg::Path RegulatedPurePursuitController::transformGlobalPlan(
 
   // Remove the portion of the global plan that we've already passed so we don't
   // process it on the next iteration (this is called path pruning)
-  global_plan_.poses.erase(begin(global_plan_.poses), transformation_begin);
-  global_path_pub_->publish(transformed_plan);
+  plan.poses.erase(begin(plan.poses), transformation_begin);
 
   if (transformed_plan.poses.empty()) {
     throw nav2_core::PlannerException("Resulting plan has 0 poses in it.");
