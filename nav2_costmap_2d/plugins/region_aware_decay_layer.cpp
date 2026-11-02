@@ -124,6 +124,11 @@ void RegionAwareDecayLayer::onInitialize()
   declareParameter("free_window", rclcpp::ParameterValue(1));
   declareParameter("observation_queue_size", rclcpp::ParameterValue(64));
   declareParameter("blind_region_names", rclcpp::ParameterValue(std::vector<std::string>{}));
+  declareParameter("blind_persistence.enabled", rclcpp::ParameterValue(false));
+  declareParameter("blind_persistence.tau_s", rclcpp::ParameterValue(1.0));
+  declareParameter("blind_persistence.alpha", rclcpp::ParameterValue(0.12));
+  declareParameter("blind_persistence.min_hold_seconds", rclcpp::ParameterValue(0.4));
+  declareParameter("blind_persistence.gamma", rclcpp::ParameterValue(1.5));
 
   std::string sources;
   int occupy_hits, occupy_window, free_misses, free_window, queue_size;
@@ -143,6 +148,11 @@ void RegionAwareDecayLayer::onInitialize()
   node->get_parameter(name_ + ".free_window", free_window);
   node->get_parameter(name_ + ".observation_queue_size", queue_size);
   node->get_parameter(name_ + ".blind_region_names", regions);
+  node->get_parameter(name_ + ".blind_persistence.enabled", blind_persistence_enabled_);
+  node->get_parameter(name_ + ".blind_persistence.tau_s", persistence_tau_s_);
+  node->get_parameter(name_ + ".blind_persistence.alpha", persistence_alpha_);
+  node->get_parameter(name_ + ".blind_persistence.min_hold_seconds", persistence_min_hold_seconds_);
+  node->get_parameter(name_ + ".blind_persistence.gamma", persistence_gamma_);
   node->get_parameter("track_unknown_space", track_unknown);
   node->get_parameter("transform_tolerance", transform_tolerance);
   require(occupy_hits >= 1 && occupy_hits <= occupy_window && occupy_window <= kMaximumHistory,
@@ -157,6 +167,15 @@ void RegionAwareDecayLayer::onInitialize()
   require(std::isfinite(min_obstacle_height_) && std::isfinite(max_obstacle_height_) &&
     min_obstacle_height_ <= max_obstacle_height_, "invalid layer height interval");
   require(finiteNonnegative(transform_tolerance), "invalid transform_tolerance");
+  require(std::isfinite(persistence_tau_s_) && persistence_tau_s_ > 0.0,
+    "blind_persistence.tau_s must be finite and positive");
+  require(std::isfinite(persistence_alpha_) &&
+    persistence_alpha_ > 0.0 && persistence_alpha_ <= 1.0,
+    "blind_persistence.alpha must be finite and in (0, 1]");
+  require(finiteNonnegative(persistence_min_hold_seconds_),
+    "blind_persistence.min_hold_seconds must be finite and nonnegative");
+  require(std::isfinite(persistence_gamma_) && persistence_gamma_ > 1.0,
+    "blind_persistence.gamma must be finite and greater than 1");
   occupy_min_hits_ = static_cast<unsigned int>(occupy_hits);
   occupy_window_ = static_cast<unsigned int>(occupy_window);
   free_min_misses_ = static_cast<unsigned int>(free_misses);
@@ -186,6 +205,9 @@ void RegionAwareDecayLayer::onInitialize()
     require(std::isfinite(region.hold_seconds) &&
       (region.hold_seconds >= 0.0 || region.hold_seconds == -1.0),
       "hold_seconds must be -1 or finite and nonnegative: " + region.name);
+    require(!blind_persistence_enabled_ || region.hold_seconds <= 0.0 ||
+      persistence_min_hold_seconds_ <= region.hold_seconds,
+      "blind_persistence.min_hold_seconds exceeds hold_seconds: " + region.name);
     blind_regions_.push_back(region);
   }
   std::istringstream source_stream(sources);
@@ -277,9 +299,12 @@ void RegionAwareDecayLayer::onInitialize()
     std::bind(&RegionAwareDecayLayer::dynamicParametersCallback, this, std::placeholders::_1));
   current_ = false;
   RCLCPP_INFO(logger_,
-    "RegionAwareDecayLayer source=%s queue=%zu a=%u/%u b=%u/%u regions=%zu",
+    "RegionAwareDecayLayer source=%s queue=%zu a=%u/%u b=%u/%u regions=%zu "
+    "blind_persistence=%s tau_s=%.3f alpha=%.3f min_hold_seconds=%.3f gamma=%.3f",
     topic.c_str(), observation_queue_size_, occupy_min_hits_, occupy_window_,
-    free_min_misses_, free_window_, blind_regions_.size());
+    free_min_misses_, free_window_, blind_regions_.size(),
+    blind_persistence_enabled_ ? "true" : "false", persistence_tau_s_, persistence_alpha_,
+    persistence_min_hold_seconds_, persistence_gamma_);
 }
 
 rcl_interfaces::msg::SetParametersResult RegionAwareDecayLayer::dynamicParametersCallback(
@@ -314,7 +339,7 @@ rcl_interfaces::msg::SetParametersResult RegionAwareDecayLayer::dynamicParameter
   if (requested_enabled != enabled_) {
     enabled_ = requested_enabled;
     clearInput();
-    clearHistories(false);
+    clearHistories();
     Costmap2D::resetMaps();
   }
   return result;
@@ -401,16 +426,10 @@ void RegionAwareDecayLayer::removeClearedPoints(
   }
 }
 
-void RegionAwareDecayLayer::clearHistories(bool retain_occupied)
+void RegionAwareDecayLayer::clearHistories()
 {
   for (auto & cell : cells_) {
-    cell.a.clear();
-    cell.b.clear();
-    if (!retain_occupied) {
-      cell.occupied = false;
-      cell.latest_hit = false;
-      cell.last_seen_ns = 0;
-    }
+    cell = CellHistory{};
   }
 }
 
@@ -422,7 +441,7 @@ bool RegionAwareDecayLayer::checkClock()
   if (backwards) {
     ++clock_resets_;
     clearInput();
-    clearHistories(false);
+    clearHistories();
     Costmap2D::resetMaps();
     RCLCPP_WARN(logger_, "RegionAwareDecayLayer ROS time moved backwards; history and input reset");
   }
@@ -574,6 +593,42 @@ void RegionAwareDecayLayer::createHitMask(const Observation & observation)
   }
 }
 
+void RegionAwareDecayLayer::updatePersistence(CellHistory & cell, int64_t observation_ns)
+{
+  // Only strictly newer sensor evidence may refresh the score and deadlines.
+  if (observation_ns <= cell.last_seen_ns) {
+    return;
+  }
+  const double elapsed_s = static_cast<double>(observation_ns - cell.last_seen_ns) / 1e9;
+  cell.persistence = std::min(1.0,
+    cell.persistence * std::exp(-elapsed_s / persistence_tau_s_) + persistence_alpha_);
+  cell.last_seen_ns = observation_ns;
+  if (cell.occupied) {
+    updateHoldDeadlines(cell);
+  }
+}
+
+void RegionAwareDecayLayer::updateHoldDeadlines(CellHistory & cell)
+{
+  cell.hold_deadlines_ns.resize(blind_regions_.size(), 0);
+  const double ratio = std::pow(cell.persistence, persistence_gamma_);
+  for (size_t r = 0; r < blind_regions_.size(); ++r) {
+    const double maximum_hold = blind_regions_[r].hold_seconds;
+    if (maximum_hold <= 0.0) {
+      continue;
+    }
+    const double hold = std::min(maximum_hold, persistence_min_hold_seconds_ +
+      (maximum_hold - persistence_min_hold_seconds_) * ratio);
+    // Round up to the next nanosecond and saturate rather than overflowing a
+    // timestamp for very large (but finite and otherwise valid) region holds.
+    const long double candidate = static_cast<long double>(cell.last_seen_ns) +
+      std::ceil(static_cast<long double>(hold) * 1e9L);
+    const auto deadline = candidate >= std::numeric_limits<int64_t>::max() ?
+      std::numeric_limits<int64_t>::max() : static_cast<int64_t>(candidate);
+    cell.hold_deadlines_ns[r] = std::max(cell.hold_deadlines_ns[r], deadline);
+  }
+}
+
 double RegionAwareDecayLayer::holdingTime(
   size_t index, double robot_x, double robot_y, double robot_yaw, std::string * region_name) const
 {
@@ -586,12 +641,21 @@ double RegionAwareDecayLayer::holdingTime(
   if (region_name) {
     *region_name = "none";
   }
-  for (const auto & region : blind_regions_) {
+  for (size_t r = 0; r < blind_regions_.size(); ++r) {
+    const auto & region = blind_regions_[r];
     if (x < region.x_min || x > region.x_max || y < region.y_min || y > region.y_max) {
       continue;
     }
-    if (region.hold_seconds == -1.0 || region.hold_seconds >= hold) {
-      hold = region.hold_seconds;
+    double region_hold = region.hold_seconds;
+    if (blind_persistence_enabled_ && region_hold > 0.0 &&
+      r < cells_[index].hold_deadlines_ns.size())
+    {
+      const auto & cell = cells_[index];
+      region_hold = static_cast<double>(std::max(
+          int64_t{0}, cell.hold_deadlines_ns[r] - cell.last_seen_ns)) / 1e9;
+    }
+    if (region_hold == -1.0 || region_hold >= hold) {
+      hold = region_hold;
       if (region_name) {
         *region_name = region.name;
       }
@@ -633,13 +697,20 @@ void RegionAwareDecayLayer::applyObservation(
     const bool hit = point_counts_[index] >= static_cast<unsigned int>(obstacle_pointcount_);
     cell.latest_hit = hit;
     if (hit) {
-      cell.last_seen_ns = event.freshness.observation.capture_ns;
+      if (blind_persistence_enabled_) {
+        updatePersistence(cell, event.freshness.observation.capture_ns);
+      } else {
+        cell.last_seen_ns = event.freshness.observation.capture_ns;
+      }
     }
     if (!cell.occupied) {
       cell.a.append(hit, occupy_window_);
       if (cell.a.count >= occupy_min_hits_) {
         cell.occupied = true;
         cell.b.clear();
+        if (blind_persistence_enabled_) {
+          updateHoldDeadlines(cell);
+        }
         RCLCPP_DEBUG(logger_, "RegionAwareDecayLayer OCCUPIED index=%zu capture_ns=%ld",
           index, cell.last_seen_ns);
       }
@@ -648,6 +719,10 @@ void RegionAwareDecayLayer::applyObservation(
       if (!hit && mayFree(index, robot_x, robot_y, robot_yaw, observation_ns)) {
         cell.occupied = false;
         cell.a.clear();
+        if (blind_persistence_enabled_) {
+          cell.persistence = 0.0;
+          cell.hold_deadlines_ns.clear();
+        }
         RCLCPP_DEBUG(logger_, "RegionAwareDecayLayer FREE index=%zu last_seen_ns=%ld",
           index, cell.last_seen_ns);
       }
@@ -814,7 +889,8 @@ void RegionAwareDecayLayer::activate()
 {
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   clearInput();
-  clearHistories(true);
+  clearHistories();
+  Costmap2D::resetMaps();
   last_clock_ns_ = clock_->now().nanoseconds();
   active_ = true;
   for (auto & subscriber : observation_subscribers_) {
@@ -830,7 +906,8 @@ void RegionAwareDecayLayer::deactivate()
     subscriber->unsubscribe();
   }
   clearInput();
-  clearHistories(true);
+  clearHistories();
+  Costmap2D::resetMaps();
 }
 
 void RegionAwareDecayLayer::resetBuffersLastUpdated()
@@ -843,7 +920,7 @@ void RegionAwareDecayLayer::reset()
 {
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   clearInput();
-  clearHistories(false);
+  clearHistories();
   Costmap2D::resetMaps();
   last_clock_ns_ = clock_->now().nanoseconds();
 }

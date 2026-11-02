@@ -40,6 +40,39 @@ public:
   {
     return this->observation_buffers_.at(0);
   }
+
+  double persistenceAt(double x, double y)
+  {
+    unsigned int mx = 0, my = 0;
+    EXPECT_TRUE(this->worldToMap(x, y, mx, my));
+    return this->cells_.at(this->getIndex(mx, my)).persistence;
+  }
+
+  std::vector<int64_t> deadlinesAt(double x, double y)
+  {
+    unsigned int mx = 0, my = 0;
+    EXPECT_TRUE(this->worldToMap(x, y, mx, my));
+    return this->cells_.at(this->getIndex(mx, my)).hold_deadlines_ns;
+  }
+
+  bool allHistoriesCleared() const
+  {
+    return std::all_of(this->cells_.begin(), this->cells_.end(), [](const auto & cell) {
+        return !cell.occupied && !cell.latest_hit && cell.last_seen_ns == 0 &&
+               cell.persistence == 0.0 && cell.hold_deadlines_ns.empty() &&
+               cell.a.values.empty() && cell.a.next == 0 && cell.a.count == 0 &&
+               cell.b.values.empty() && cell.b.next == 0 && cell.b.count == 0;
+      });
+  }
+
+  bool gridIs(unsigned char value)
+  {
+    const auto * grid = this->getCharMap();
+    const size_t size = static_cast<size_t>(this->getSizeInCellsX()) * this->getSizeInCellsY();
+    return std::all_of(grid, grid + size, [value](unsigned char cost) {return cost == value;});
+  }
+
+  size_t queuedObservations() const {return this->queue_.size();}
 };
 
 Parameters region(
@@ -60,6 +93,18 @@ Parameters region(
 void append(Parameters & destination, const Parameters & additions)
 {
   destination.insert(destination.end(), additions.begin(), additions.end());
+}
+
+Parameters adaptivePersistence(
+  double tau_s = 1.0, double alpha = 0.12,
+  double min_hold_seconds = 0.0, double gamma = 2.0)
+{
+  return {
+    rclcpp::Parameter("obstacles.blind_persistence.enabled", true),
+    rclcpp::Parameter("obstacles.blind_persistence.tau_s", tau_s),
+    rclcpp::Parameter("obstacles.blind_persistence.alpha", alpha),
+    rclcpp::Parameter("obstacles.blind_persistence.min_hold_seconds", min_hold_seconds),
+    rclcpp::Parameter("obstacles.blind_persistence.gamma", gamma)};
 }
 
 std::vector<geometry_msgs::msg::Point> rectangularFootprint()
@@ -122,14 +167,15 @@ protected:
     return result;
   }
 
-  void configure(const Parameters & additions = {}, bool rolling = true)
+  void configure(
+    const Parameters & additions = {}, bool rolling = true, bool track_unknown = false)
   {
     release();
     rclcpp::NodeOptions options;
     options.parameter_overrides(mergedParameters(additions));
     node_ = std::make_shared<nav2_util::LifecycleNode>(
       "region_aware_decay_layer_test", "", options);
-    node_->declare_parameter("track_unknown_space", false);
+    node_->declare_parameter("track_unknown_space", track_unknown);
     node_->declare_parameter("transform_tolerance", 0.0);
     ASSERT_EQ(RCL_RET_OK, rcl_enable_ros_time_override(node_->get_clock()->get_clock_handle()));
     setTime(100000);
@@ -137,7 +183,7 @@ protected:
     // All transforms are supplied synchronously by the fixture; no listener
     // thread or executor is needed to satisfy these deterministic lookups.
     tf_->setUsingDedicatedThread(true);
-    map_ = std::make_unique<LayeredCostmap>("map", rolling, false);
+    map_ = std::make_unique<LayeredCostmap>("map", rolling, track_unknown);
     map_->resizeMap(200, 200, 0.05, 0.0, 0.0);
     map_->setFootprint(rectangularFootprint());
     layer_ = std::make_shared<TestLayer<RegionAwareDecayLayer>>();
@@ -210,6 +256,20 @@ protected:
   }
 
   unsigned char obstacleCost() {return costAt(obstacle()[0], obstacle()[1]);}
+
+  double persistence() {return layer_->persistenceAt(obstacle()[0], obstacle()[1]);}
+
+  std::vector<int64_t> deadlines()
+  {
+    return layer_->deadlinesAt(obstacle()[0], obstacle()[1]);
+  }
+
+  void expectNoPersistence()
+  {
+    EXPECT_DOUBLE_EQ(0.0, persistence());
+    const auto values = deadlines();
+    EXPECT_TRUE(std::all_of(values.begin(), values.end(), [](int64_t value) {return value == 0;}));
+  }
 
   void initializeObstacle()
   {
@@ -1011,23 +1071,110 @@ TEST_F(RegionAwareDecayLayerTest, SizeChangesAndExplicitResetDiscardHistoryAndQu
   }
 }
 
-TEST_F(RegionAwareDecayLayerTest, ReactivationNeedsNewInputAndCannotApplyAPreviousQueuedMiss)
+TEST_F(RegionAwareDecayLayerTest, LifecycleCallsImmediatelyClearGridHistoriesAndQueuedObservations)
 {
-  configure({rclcpp::Parameter("obstacles.free_min_misses", 2),
+  const XYZ partial{{4.225f, 3.225f, 0.5f}};
+  for (bool adaptive : {false, true}) {
+    for (bool track_unknown : {false, true}) {
+      for (bool activate : {false, true}) {
+        SCOPED_TRACE(adaptive);
+        SCOPED_TRACE(track_unknown);
+        SCOPED_TRACE(activate);
+        auto parameters = region(20.0);
+        if (adaptive) {
+          append(parameters, adaptivePersistence(1.0, 0.5));
+        }
+        append(parameters, {rclcpp::Parameter("obstacles.occupy_min_hits", 2),
+          rclcpp::Parameter("obstacles.occupy_window", 3),
+          rclcpp::Parameter("obstacles.free_min_misses", 2),
+          rclcpp::Parameter("obstacles.free_window", 3)});
+        configure(parameters, true, track_unknown);
+        receive(99900);
+        receive(99920);
+        receiveMessage(cloud(99940, {partial}));
+        update();
+        ASSERT_EQ(LETHAL_OBSTACLE, obstacleCost());
+        ASSERT_EQ(FREE_SPACE, costAt(partial[0], partial[1]));
+        ASSERT_TRUE(map_->isCurrent());
+        ASSERT_FALSE(layer_->allHistoriesCleared());
+        ASSERT_FALSE(layer_->gridIs(track_unknown ? NO_INFORMATION : FREE_SPACE));
+        receiveMessage(cloud(99960, {obstacle(), partial}));
+        receive(99970, true);
+        ASSERT_EQ(2u, layer_->queuedObservations());
+
+        // Test each call independently: a reset in the other lifecycle call
+        // must not hide retained grid cells or histories here.
+        if (activate) {
+          layer_->activate();
+        } else {
+          layer_->deactivate();
+        }
+        EXPECT_FALSE(layer_->isCurrent());
+        EXPECT_FALSE(map_->isCurrent());
+        EXPECT_TRUE(layer_->allHistoriesCleared());
+        EXPECT_TRUE(layer_->gridIs(track_unknown ? NO_INFORMATION : FREE_SPACE));
+        EXPECT_EQ(0u, layer_->queuedObservations());
+        update();
+        EXPECT_FALSE(map_->isCurrent());
+        EXPECT_TRUE(layer_->allHistoriesCleared());
+        EXPECT_TRUE(layer_->gridIs(track_unknown ? NO_INFORMATION : FREE_SPACE));
+      }
+    }
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, ReactivationRequiresNewHitsToRebuildFixedHoldOccupancy)
+{
+  auto parameters = region(20.0);
+  append(parameters, {rclcpp::Parameter("obstacles.occupy_min_hits", 2),
+    rclcpp::Parameter("obstacles.occupy_window", 3),
+    rclcpp::Parameter("obstacles.free_min_misses", 2),
     rclcpp::Parameter("obstacles.free_window", 3)});
-  initializeObstacle();
+  configure(parameters);
+  receive(99900);
+  receive(99920);
   receive(99930, true);
+  update();
+  ASSERT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  receive(99940);
+  receive(99945, true);
   layer_->deactivate();
   layer_->activate();
   update();
   EXPECT_FALSE(map_->isCurrent());
-  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
   receive(99950, true);
   update();
   EXPECT_TRUE(map_->isCurrent());
-  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
-  receive(99975, true);
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+  receive(99960);
   update();
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+  receive(99975);
+  update();
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  // Outside the blind region, only the two new misses may satisfy b.
+  receive(99980, true);
+  update(3.0, 5.0);
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  receive(99990, true);
+  update(3.0, 5.0);
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+}
+
+TEST_F(RegionAwareDecayLayerTest, CallbacksWhileDeactivatedCannotRepopulateResetHistory)
+{
+  initializeObstacle();
+  layer_->deactivate();
+  receive(99950);
+  update();
+  EXPECT_FALSE(map_->isCurrent());
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+  EXPECT_TRUE(layer_->allHistoriesCleared());
+  EXPECT_EQ(0u, layer_->queuedObservations());
+  layer_->activate();
+  update();
+  EXPECT_FALSE(map_->isCurrent());
   EXPECT_EQ(FREE_SPACE, obstacleCost());
 }
 
@@ -1106,6 +1253,489 @@ TEST_F(RegionAwareDecayLayerTest, NewHistoryConfigurationCannotBeChangedHalfwayT
     {rclcpp::Parameter("obstacles.occupy_window", 2)});
   EXPECT_FALSE(result.successful);
   initializeObstacle();
+}
+
+TEST_F(RegionAwareDecayLayerTest, PersistenceCountsOneHitPerCloudBeforeOccupancy)
+{
+  auto parameters = adaptivePersistence();
+  append(parameters, region(20.0));
+  append(parameters, {rclcpp::Parameter("obstacles.occupy_min_hits", 3),
+    rclcpp::Parameter("obstacles.occupy_window", 3)});
+  configure(parameters);
+  receiveMessage(cloud(99790, {obstacle(), obstacle(), obstacle()}));
+  update();
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+  EXPECT_DOUBLE_EQ(0.12, persistence());
+  const auto before_occupancy = deadlines();
+  EXPECT_TRUE(std::all_of(
+      before_occupancy.begin(), before_occupancy.end(), [](int64_t value) {return value == 0;}));
+
+  receive(99890);
+  update();
+  const double second = 0.12 * std::exp(-0.1) + 0.12;
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+  EXPECT_NEAR(second, persistence(), 1e-12);
+  receive(99990);
+  update();
+  const double third = second * std::exp(-0.1) + 0.12;
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  EXPECT_NEAR(third, persistence(), 1e-12);
+  ASSERT_EQ(1u, deadlines().size());
+  EXPECT_NEAR(99990000000LL + 20.0 * third * third * 1e9, deadlines()[0], 2.0);
+}
+
+TEST_F(RegionAwareDecayLayerTest, PersistenceDependsOnHitIntervalsAndSaturatesAtOne)
+{
+  std::vector<double> scores;
+  for (const int64_t interval_ms : {100, 500}) {
+    configure(adaptivePersistence());
+    for (int hit = 0; hit < 3; ++hit) {
+      const int64_t stamp_ms = 99990 + hit * interval_ms;
+      setTime(stamp_ms + 10);
+      receive(stamp_ms);
+      update();
+    }
+    const double retained = std::exp(-interval_ms / 1000.0);
+    EXPECT_NEAR(0.12 * (1.0 + retained + retained * retained), persistence(), 1e-12);
+    scores.push_back(persistence());
+  }
+  EXPECT_GT(scores[0], scores[1]);
+
+  configure(adaptivePersistence(1.0, 0.8));
+  receive(99900);
+  receive(99950);
+  update();
+  EXPECT_DOUBLE_EQ(1.0, persistence());
+}
+
+TEST_F(RegionAwareDecayLayerTest, PersistenceIgnoresRetainedGridAndRejectedHits)
+{
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(20.0));
+  configure(parameters);
+  initializeObstacle();
+  const auto original_deadlines = deadlines();
+  for (const int64_t invalid_stamp : {99900, 99899, 100001}) {
+    receive(invalid_stamp);
+    update();
+    EXPECT_FALSE(map_->isCurrent());
+    EXPECT_DOUBLE_EQ(0.5, persistence());
+    EXPECT_EQ(original_deadlines, deadlines());
+  }
+  receive(99950, true);
+  update();
+  setTime(101000);
+  update();
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  EXPECT_DOUBLE_EQ(0.5, persistence());
+  EXPECT_EQ(original_deadlines, deadlines());
+}
+
+TEST_F(RegionAwareDecayLayerTest, AdaptiveDeadlinesArePreparedOutsideRegionsAndOverlapUsesMaximum)
+{
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(0.4, "short"));
+  append(parameters, region(2.0, "long"));
+  append(parameters, {
+    rclcpp::Parameter("obstacles.blind_region_names", std::vector<std::string>{"short", "long"})});
+  configure(parameters);
+  receive(99900);
+  // The hit is outside both blind regions. Prepare both deadlines anyway.
+  update(3.0, 5.0);
+  ASSERT_EQ(2u, deadlines().size());
+  EXPECT_NEAR(100000000000LL, deadlines()[0], 2.0);
+  EXPECT_NEAR(100400000000LL, deadlines()[1], 2.0);
+  const auto prepared = deadlines();
+
+  setTime(100100);
+  receive(100090, true);
+  update();
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  EXPECT_EQ(prepared, deadlines());
+  // Entering the regions must not start another 0.5-second hold.
+  setTime(100420);
+  receive(100410, true);
+  update();
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+  expectNoPersistence();
+}
+
+TEST_F(RegionAwareDecayLayerTest, AdaptiveHoldUsesOnlyCurrentlyOccupiedRegions)
+{
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(2.0, "short", -0.1, 0.6));
+  append(parameters, region(8.0, "long"));
+  append(parameters, {
+    rclcpp::Parameter("obstacles.blind_region_names", std::vector<std::string>{"short", "long"})});
+  for (bool outside_all : {false, true}) {
+    SCOPED_TRACE(outside_all);
+    configure(parameters);
+    initializeObstacle();
+    ASSERT_EQ(2u, deadlines().size());
+    EXPECT_GT(deadlines()[1], deadlines()[0]);
+    const int64_t miss_ms = outside_all ? 99950 : 100450;
+    setTime(std::max(int64_t{100000}, miss_ms + 10));
+    receive(miss_ms, true);
+    // At x=3 only "short" applies; at x=4 neither region applies. Neither
+    // situation may use the still-future deadline prepared for "long".
+    update(outside_all ? 4.0 : 3.0, 5.0);
+    EXPECT_EQ(FREE_SPACE, obstacleCost());
+    expectNoPersistence();
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, AdaptiveHoldInterpolatesFromTheConfiguredMinimum)
+{
+  for (const double minimum : {0.0, 0.4, 2.0}) {
+    SCOPED_TRACE(minimum);
+    auto parameters = adaptivePersistence(1.0, 0.5, minimum);
+    append(parameters, region(2.0));
+    configure(parameters);
+    initializeObstacle();
+    ASSERT_EQ(1u, deadlines().size());
+    const double expected_hold = minimum + (2.0 - minimum) * 0.25;
+    EXPECT_NEAR(99900000000LL + expected_hold * 1e9, deadlines()[0], 2.0);
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, AdaptiveHoldPreservesZeroAndInfiniteRegionSemantics)
+{
+  for (const double hold_seconds : {0.0, -1.0}) {
+    SCOPED_TRACE(hold_seconds);
+    auto parameters = adaptivePersistence(1.0, 0.5);
+    append(parameters, region(hold_seconds, "special"));
+    append(parameters, region(2.0, "finite", -0.1, 0.6));
+    append(parameters, {
+      rclcpp::Parameter("obstacles.blind_region_names", std::vector<std::string>{"special", "finite"}),
+      rclcpp::Parameter("obstacles.free_min_misses", 2),
+      rclcpp::Parameter("obstacles.free_window", 3)});
+    configure(parameters);
+    initializeObstacle();
+    receive(99930, true);
+    update();
+    EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+    setTime(103000);
+    receive(102990, true);
+    update();
+    EXPECT_EQ(hold_seconds < 0.0 ? LETHAL_OBSTACLE : FREE_SPACE, obstacleCost());
+  }
+
+  // An overlapping infinite region still overrides an expired finite hold.
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(0.4, "finite"));
+  append(parameters, region(-1.0, "infinite"));
+  append(parameters, {
+    rclcpp::Parameter("obstacles.blind_region_names", std::vector<std::string>{"finite", "infinite"})});
+  configure(parameters);
+  initializeObstacle();
+  setTime(101000);
+  receive(100990, true);
+  update();
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+}
+
+TEST_F(RegionAwareDecayLayerTest, RehitCanLowerPersistenceWithoutShorteningDeadlineAndCanExtendIt)
+{
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(20.0));
+  configure(parameters);
+  receive(99990);
+  receive(99991);
+  receive(99992);
+  update();
+  ASSERT_DOUBLE_EQ(1.0, persistence());
+  ASSERT_EQ(1u, deadlines().size());
+  const int64_t original_deadline = deadlines()[0];
+
+  setTime(101002);
+  receive(100992);
+  update();
+  const double lower_score = std::exp(-1.0) + 0.5;
+  EXPECT_NEAR(lower_score, persistence(), 1e-12);
+  EXPECT_EQ(original_deadline, deadlines()[0]);
+
+  // Even with a lower score, a sufficiently later hit can produce a later
+  // absolute deadline. Compare deadlines, rather than comparing scores.
+  setTime(119002);
+  receive(118992);
+  update();
+  const double latest_score = lower_score * std::exp(-18.0) + 0.5;
+  EXPECT_NEAR(latest_score, persistence(), 1e-12);
+  EXPECT_LT(persistence(), lower_score);
+  EXPECT_GT(deadlines()[0], original_deadline);
+  EXPECT_NEAR(118992000000LL + 20.0 * latest_score * latest_score * 1e9, deadlines()[0], 2.0);
+}
+
+TEST_F(RegionAwareDecayLayerTest, AdaptiveExpiryStillNeedsAFreshMissAndTheMissThreshold)
+{
+  for (const int misses_before_expiry : {0, 2}) {
+    SCOPED_TRACE(misses_before_expiry);
+    auto parameters = adaptivePersistence(1.0, 0.5);
+    append(parameters, region(0.8));
+    append(parameters, {rclcpp::Parameter("obstacles.free_min_misses", 2),
+      rclcpp::Parameter("obstacles.free_window", 3),
+      rclcpp::Parameter("obstacles.camera.expected_update_rate", 1.0),
+      rclcpp::Parameter("obstacles.camera.max_observation_age", 1.0)});
+    configure(parameters);
+    initializeObstacle();
+    const auto original_deadlines = deadlines();
+    for (int miss = 0; miss < misses_before_expiry; ++miss) {
+      receive(99930 + miss * 30, true);
+      update();
+      EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+      EXPECT_DOUBLE_EQ(0.5, persistence());
+      EXPECT_EQ(original_deadlines, deadlines());
+    }
+    // Deadline is 100.100. Timer updates and even a delayed, pre-deadline
+    // capture must not clear the cell using the current timer time.
+    setTime(100200);
+    update();
+    EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+    receive(100090, true);
+    update();
+    EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+    EXPECT_EQ(original_deadlines, deadlines());
+
+    receive(100190, true);
+    update();
+    EXPECT_EQ(FREE_SPACE, obstacleCost());
+    expectNoPersistence();
+    // A fresh occupancy must start with alpha; no old score or deadline survives Free.
+    receive(100195);
+    update();
+    EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+    EXPECT_DOUBLE_EQ(0.5, persistence());
+    ASSERT_EQ(1u, deadlines().size());
+    EXPECT_NEAR(100395000000LL, deadlines()[0], 2.0);
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, AdaptiveExpiryDoesNotReplaceTheMissThreshold)
+{
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(0.4));
+  append(parameters, {rclcpp::Parameter("obstacles.free_min_misses", 2),
+    rclcpp::Parameter("obstacles.free_window", 3)});
+  configure(parameters);
+  initializeObstacle();
+  setTime(100100);
+  receive(100090, true);
+  update();
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  receive(100095, true);
+  update();
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+}
+
+TEST_F(RegionAwareDecayLayerTest, ReactivationStartsAdaptiveScoresAndDeadlinesFromNewHits)
+{
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(20.0));
+  append(parameters, {rclcpp::Parameter("obstacles.occupy_min_hits", 2),
+    rclcpp::Parameter("obstacles.occupy_window", 3)});
+  configure(parameters);
+  receive(99900);
+  receive(99910);
+  receive(99920);
+  receive(99930, true);
+  update();
+  ASSERT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  ASSERT_DOUBLE_EQ(1.0, persistence());
+  ASSERT_EQ(1u, deadlines().size());
+  const int64_t previous_deadline = deadlines()[0];
+  receive(99940);
+  layer_->deactivate();
+  EXPECT_TRUE(layer_->allHistoriesCleared());
+  EXPECT_TRUE(layer_->gridIs(FREE_SPACE));
+  layer_->activate();
+  EXPECT_TRUE(layer_->allHistoriesCleared());
+  EXPECT_TRUE(layer_->gridIs(FREE_SPACE));
+  update();
+  EXPECT_FALSE(map_->isCurrent());
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+  expectNoPersistence();
+  receive(99950);
+  update();
+  EXPECT_TRUE(map_->isCurrent());
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+  EXPECT_DOUBLE_EQ(0.5, persistence());
+  EXPECT_TRUE(deadlines().empty());
+  receive(99960);
+  update();
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  const double score = 0.5 * std::exp(-0.01) + 0.5;
+  EXPECT_NEAR(score, persistence(), 1e-12);
+  ASSERT_EQ(1u, deadlines().size());
+  EXPECT_NEAR(99960000000LL + 20.0 * score * score * 1e9, deadlines()[0], 2.0);
+  EXPECT_LT(deadlines()[0], previous_deadline);
+}
+
+TEST_F(RegionAwareDecayLayerTest, AdaptiveStateIsDiscardedByClearResetResizeClockAndEnableChanges)
+{
+  for (int action = 0; action < 5; ++action) {
+    SCOPED_TRACE(action);
+    auto parameters = adaptivePersistence(1.0, 0.5);
+    append(parameters, region(20.0));
+    configure(parameters);
+    initializeObstacle();
+    ASSERT_GT(persistence(), 0.0);
+    ASSERT_FALSE(deadlines().empty());
+    receive(99950);
+    int64_t next_stamp = 99975;
+    switch (action) {
+      case 0:
+        clearWorldRectangle(2.0, 4.0, false);
+        break;
+      case 1:
+        layer_->reset();
+        break;
+      case 2:
+        map_->resizeMap(100, 100, 0.1, 0.0, 0.0);
+        break;
+      case 3:
+        setTime(90000);
+        next_stamp = 89990;
+        break;
+      default:
+        ASSERT_TRUE(node_->set_parameters_atomically(
+            {rclcpp::Parameter("obstacles.enabled", false)}).successful);
+        ASSERT_TRUE(node_->set_parameters_atomically(
+            {rclcpp::Parameter("obstacles.enabled", true)}).successful);
+        break;
+    }
+    update();
+    EXPECT_EQ(FREE_SPACE, obstacleCost());
+    expectNoPersistence();
+    receive(next_stamp);
+    update();
+    EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+    EXPECT_DOUBLE_EQ(0.5, persistence());
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, RollingMovesAdaptiveStateWithWorldCellAndDropsItOutsideWindow)
+{
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(20.0, "all", -100.0, 100.0, -100.0, 100.0));
+  configure(parameters);
+  initializeObstacle();
+  const auto original_deadlines = deadlines();
+  update(6.0, 6.0, 1.5);
+  EXPECT_DOUBLE_EQ(0.5, persistence());
+  EXPECT_EQ(original_deadlines, deadlines());
+  EXPECT_DOUBLE_EQ(0.0, layer_->persistenceAt(obstacle()[0] + 1.0, obstacle()[1] + 1.0));
+  receive(99950);
+  update(6.0, 6.0);
+  EXPECT_NEAR(0.5 * std::exp(-0.05) + 0.5, persistence(), 1e-12);
+  update(25.0, 25.0);
+  update();
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+  expectNoPersistence();
+  receive(99975);
+  update();
+  EXPECT_DOUBLE_EQ(0.5, persistence());
+}
+
+TEST_F(RegionAwareDecayLayerTest, FootprintClearingDiscardsAdaptiveEvidence)
+{
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(20.0, "all", -100.0, 100.0, -100.0, 100.0));
+  append(parameters, {rclcpp::Parameter("obstacles.footprint_clearing_enabled", true)});
+  configure(parameters);
+  const XYZ corner{{4.575f, 5.225f, 0.5f}};
+  receiveMessage(cloud(99900, {corner}));
+  update(6.0, 5.0);
+  ASSERT_EQ(LETHAL_OBSTACLE, costAt(corner[0], corner[1]));
+  ASSERT_DOUBLE_EQ(0.5, layer_->persistenceAt(corner[0], corner[1]));
+  update();
+  EXPECT_EQ(FREE_SPACE, costAt(corner[0], corner[1]));
+  EXPECT_DOUBLE_EQ(0.0, layer_->persistenceAt(corner[0], corner[1]));
+  const auto cleared_deadlines = layer_->deadlinesAt(corner[0], corner[1]);
+  EXPECT_TRUE(std::all_of(
+      cleared_deadlines.begin(), cleared_deadlines.end(), [](int64_t value) {return value == 0;}));
+  update(6.0, 5.0);
+  receiveMessage(cloud(99950, {corner}));
+  update(6.0, 5.0);
+  EXPECT_EQ(LETHAL_OBSTACLE, costAt(corner[0], corner[1]));
+  EXPECT_DOUBLE_EQ(0.5, layer_->persistenceAt(corner[0], corner[1]));
+}
+
+TEST_F(RegionAwareDecayLayerTest, DisabledPersistenceKeepsTheFixedRegionHold)
+{
+  auto parameters = adaptivePersistence(1.0, 0.12);
+  append(parameters, region(1.0));
+  append(parameters, {rclcpp::Parameter("obstacles.blind_persistence.enabled", false)});
+  configure(parameters);
+  initializeObstacle();
+  receive(99950, true);
+  update();
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  setTime(101000);
+  receive(100990, true);
+  update();
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+}
+
+TEST_F(RegionAwareDecayLayerTest, LargeFiniteAdaptiveHoldsSaturateTheDeadlineWithoutOverflow)
+{
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(std::numeric_limits<double>::max()));
+  configure(parameters);
+  initializeObstacle();
+  ASSERT_EQ(1u, deadlines().size());
+  EXPECT_EQ(std::numeric_limits<int64_t>::max(), deadlines()[0]);
+  receive(99950, true);
+  update();
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+}
+
+TEST_F(RegionAwareDecayLayerTest, InvalidPersistenceParametersAreRejectedAtInitialization)
+{
+  Parameters invalid{
+    rclcpp::Parameter("obstacles.blind_persistence.tau_s", 0.0),
+    rclcpp::Parameter("obstacles.blind_persistence.tau_s", -1.0),
+    rclcpp::Parameter("obstacles.blind_persistence.alpha", 0.0),
+    rclcpp::Parameter("obstacles.blind_persistence.alpha", -0.1),
+    rclcpp::Parameter("obstacles.blind_persistence.alpha", 1.01),
+    rclcpp::Parameter("obstacles.blind_persistence.min_hold_seconds", -0.1),
+    rclcpp::Parameter("obstacles.blind_persistence.gamma", 1.0),
+    rclcpp::Parameter("obstacles.blind_persistence.gamma", 0.0)};
+  for (const std::string name : {"tau_s", "alpha", "min_hold_seconds", "gamma"}) {
+    for (double value : {std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::quiet_NaN()})
+    {
+      invalid.emplace_back("obstacles.blind_persistence." + name, value);
+    }
+  }
+  for (const auto & parameter : invalid) {
+    SCOPED_TRACE(parameter.get_name());
+    auto parameters = adaptivePersistence();
+    parameters.push_back(parameter);
+    EXPECT_ANY_THROW(configure(parameters));
+  }
+  auto parameters = adaptivePersistence(1.0, 0.12, 0.6);
+  append(parameters, region(0.5));
+  EXPECT_ANY_THROW(configure(parameters));
+  append(parameters, {rclcpp::Parameter("obstacles.blind_persistence.enabled", false)});
+  EXPECT_NO_THROW(configure(parameters));
+
+  parameters = adaptivePersistence(1.0, 0.12, 0.4);
+  append(parameters, region(1.0, "long"));
+  append(parameters, region(0.2, "short"));
+  append(parameters, {
+    rclcpp::Parameter("obstacles.blind_region_names", std::vector<std::string>{"long", "short"})});
+  EXPECT_ANY_THROW(configure(parameters));
+}
+
+TEST_F(RegionAwareDecayLayerTest, PersistenceParametersRequireReconfiguration)
+{
+  configure(adaptivePersistence());
+  auto changes = adaptivePersistence(2.0, 0.2, 0.1, 3.0);
+  changes.front() = rclcpp::Parameter("obstacles.blind_persistence.enabled", false);
+  for (const auto & parameter : changes) {
+    const auto result = node_->set_parameters_atomically({parameter});
+    EXPECT_FALSE(result.successful) << parameter.get_name();
+  }
 }
 
 TEST_F(RegionAwareDecayLayerTest, BothOldAndNewClassesAreLoadableThroughPluginlib)

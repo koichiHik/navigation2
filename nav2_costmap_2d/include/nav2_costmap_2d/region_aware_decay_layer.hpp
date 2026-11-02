@@ -121,6 +121,9 @@ protected:
     int64_t last_seen_ns = 0;
     History a;
     History b;
+    double persistence = 0.0;
+    // Indexed like blind_regions_; only positive finite holds have deadlines.
+    std::vector<int64_t> hold_deadlines_ns;
   };
 
   struct QueuedObservation
@@ -154,9 +157,11 @@ private:
   void removeClearedPoints(
     sensor_msgs::msg::PointCloud2 & cloud,
     int start_x, int start_y, int end_x, int end_y, bool invert) const;
-  void clearHistories(bool retain_occupied);
+  void clearHistories();
   bool checkClock();
   void createHitMask(const Observation & observation);
+  void updatePersistence(CellHistory & cell, int64_t observation_ns);
+  void updateHoldDeadlines(CellHistory & cell);
   void applyObservation(
     const QueuedObservation & event, double robot_x, double robot_y,
     double robot_yaw, int64_t observation_ns);
@@ -195,6 +200,11 @@ private:
   double min_obstacle_height_ = 0.0;
   double max_obstacle_height_ = 2.0;
   bool footprint_clearing_enabled_ = true;
+  bool blind_persistence_enabled_ = false;
+  double persistence_tau_s_ = 1.0;
+  double persistence_alpha_ = 0.12;
+  double persistence_min_hold_seconds_ = 0.4;
+  double persistence_gamma_ = 1.5;
   bool rolling_window_ = false;
   bool update_pending_ = false;
   bool active_ = false;
