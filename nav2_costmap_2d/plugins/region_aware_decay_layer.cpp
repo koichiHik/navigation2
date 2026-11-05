@@ -73,6 +73,100 @@ bool finiteNonnegative(double value)
 {
   return std::isfinite(value) && value >= 0.0;
 }
+
+using Point2 = std::array<double, 2>;
+constexpr long double kGeometryTolerance = 32.0L * std::numeric_limits<double>::epsilon();
+
+int orientation(const Point2 & a, const Point2 & b, const Point2 & point)
+{
+  const long double dx = static_cast<long double>(b[0]) - a[0];
+  const long double dy = static_cast<long double>(b[1]) - a[1];
+  const long double px = static_cast<long double>(point[0]) - a[0];
+  const long double py = static_cast<long double>(point[1]) - a[1];
+  const long double first = dx * py, second = dy * px;
+  const long double cross = first - second;
+  const long double tolerance = kGeometryTolerance * (std::abs(first) + std::abs(second));
+  return cross > tolerance ? 1 : (cross < -tolerance ? -1 : 0);
+}
+
+bool onSegment(const Point2 & a, const Point2 & b, const Point2 & point)
+{
+  if (orientation(a, b, point) != 0) {
+    return false;
+  }
+  for (size_t axis = 0; axis < 2; ++axis) {
+    const long double end = static_cast<long double>(b[axis]) - a[axis];
+    const long double offset = static_cast<long double>(point[axis]) - a[axis];
+    const long double tolerance = kGeometryTolerance *
+      std::max({1.0L, std::abs(end), std::abs(offset)});
+    if (offset < std::min(0.0L, end) - tolerance ||
+      offset > std::max(0.0L, end) + tolerance)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool segmentsIntersect(const Point2 & a, const Point2 & b, const Point2 & c, const Point2 & d)
+{
+  const int abc = orientation(a, b, c), abd = orientation(a, b, d);
+  const int cda = orientation(c, d, a), cdb = orientation(c, d, b);
+  return (abc * abd < 0 && cda * cdb < 0) ||
+         (abc == 0 && onSegment(a, b, c)) || (abd == 0 && onSegment(a, b, d)) ||
+         (cda == 0 && onSegment(c, d, a)) || (cdb == 0 && onSegment(c, d, b));
+}
+
+bool validPolygon(const std::vector<Point2> & points)
+{
+  long double area = 0.0L, area_scale = 0.0L;
+  for (size_t i = 0; i < points.size(); ++i) {
+    const size_t next = (i + 1) % points.size();
+    const size_t after = (i + 2) % points.size();
+    if (points[i] == points[next] || onSegment(points[i], points[next], points[after]) ||
+      onSegment(points[next], points[after], points[i]))
+    {
+      // Adjacent edges may share their endpoint, but must not double back.
+      return false;
+    }
+    for (size_t j = i + 1; j < points.size(); ++j) {
+      const size_t j_next = (j + 1) % points.size();
+      if (next != j && j_next != i &&
+        segmentsIntersect(points[i], points[next], points[j], points[j_next]))
+      {
+        return false;
+      }
+    }
+    // Translate before forming the signed area to avoid cancellation from a
+    // polygon's distance to the origin. Long double also avoids double overflow.
+    const long double x = static_cast<long double>(points[i][0]) - points[0][0];
+    const long double y = static_cast<long double>(points[i][1]) - points[0][1];
+    const long double nx = static_cast<long double>(points[next][0]) - points[0][0];
+    const long double ny = static_cast<long double>(points[next][1]) - points[0][1];
+    area += x * ny - y * nx;
+    area_scale += std::abs(x * ny) + std::abs(y * nx);
+  }
+  return std::abs(area) > kGeometryTolerance * area_scale;
+}
+
+bool polygonContains(const std::vector<Point2> & points, double x, double y)
+{
+  const Point2 point{{x, y}};
+  bool inside = false;
+  for (size_t i = 0; i < points.size(); ++i) {
+    const auto & a = points[i];
+    const auto & b = points[(i + 1) % points.size()];
+    if (onSegment(a, b, point)) {
+      return true;
+    }
+    if ((a[1] > y) != (b[1] > y) &&
+      (orientation(a, b, point) > 0) == (b[1] > a[1]))
+    {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
 }  // namespace
 
 void RegionAwareDecayLayer::History::append(bool evidence, unsigned int window)
@@ -187,21 +281,54 @@ void RegionAwareDecayLayer::onInitialize()
     require(!region_name.empty() && region_name.find('.') == std::string::npos &&
       distinct_names.insert(region_name).second, "blind region names must be nonempty and unique");
     const auto prefix = "blind_region." + region_name + ".";
-    for (const auto * key : {"x_min", "x_max", "y_min", "y_max", "hold_seconds"}) {
-      // Missing geometry must fail validation, rather than silently become a box at zero.
-      declareParameter(prefix + key, rclcpp::ParameterValue(std::numeric_limits<double>::quiet_NaN()));
-    }
-    BlindRegion region;
+    const auto supplied = [&](const std::string & key) {
+        const auto full_name = name_ + "." + prefix + key;
+        const auto & overrides = node->get_node_parameters_interface()->get_parameter_overrides();
+        return node->has_parameter(full_name) || overrides.count(full_name) != 0;
+      };
+    const bool supplied_bounds = supplied("x_min") || supplied("x_max") ||
+      supplied("y_min") || supplied("y_max");
+    const bool supplied_points = supplied("points");
+    declareParameter(prefix + "shape", rclcpp::ParameterValue(std::string("rectangle")));
+    declareParameter(prefix + "hold_seconds",
+      rclcpp::ParameterValue(std::numeric_limits<double>::quiet_NaN()));
+    BlindRegion region{};
     region.name = region_name;
-    node->get_parameter(name_ + "." + prefix + "x_min", region.x_min);
-    node->get_parameter(name_ + "." + prefix + "x_max", region.x_max);
-    node->get_parameter(name_ + "." + prefix + "y_min", region.y_min);
-    node->get_parameter(name_ + "." + prefix + "y_max", region.y_max);
     node->get_parameter(name_ + "." + prefix + "hold_seconds", region.hold_seconds);
-    require(std::isfinite(region.x_min) && std::isfinite(region.x_max) &&
-      std::isfinite(region.y_min) && std::isfinite(region.y_max) &&
-      region.x_min < region.x_max && region.y_min < region.y_max,
-      "invalid geometry for blind region " + region.name);
+    std::string shape;
+    node->get_parameter(name_ + "." + prefix + "shape", shape);
+    if (shape == "rectangle") {
+      require(!supplied_points, "rectangle cannot specify points: " + region.name);
+      // Declare only the selected geometry so another plugin instance on this
+      // node does not mistake unused default parameters for mixed geometry.
+      for (const auto * key : {"x_min", "x_max", "y_min", "y_max"}) {
+        declareParameter(prefix + key,
+          rclcpp::ParameterValue(std::numeric_limits<double>::quiet_NaN()));
+      }
+      node->get_parameter(name_ + "." + prefix + "x_min", region.x_min);
+      node->get_parameter(name_ + "." + prefix + "x_max", region.x_max);
+      node->get_parameter(name_ + "." + prefix + "y_min", region.y_min);
+      node->get_parameter(name_ + "." + prefix + "y_max", region.y_max);
+      require(std::isfinite(region.x_min) && std::isfinite(region.x_max) &&
+        std::isfinite(region.y_min) && std::isfinite(region.y_max) &&
+        region.x_min < region.x_max && region.y_min < region.y_max,
+        "invalid geometry for blind region " + region.name);
+    } else if (shape == "polygon") {
+      require(!supplied_bounds, "polygon cannot specify rectangle bounds: " + region.name);
+      declareParameter(prefix + "points", rclcpp::ParameterValue(std::vector<double>{}));
+      std::vector<double> points;
+      node->get_parameter(name_ + "." + prefix + "points", points);
+      require(points.size() >= 6 && points.size() % 2 == 0 &&
+        std::all_of(points.begin(), points.end(), [](double value) {return std::isfinite(value);}),
+        "polygon requires at least three finite x/y pairs: " + region.name);
+      for (size_t i = 0; i < points.size(); i += 2) {
+        region.points.push_back({{points[i], points[i + 1]}});
+      }
+      require(validPolygon(region.points),
+        "polygon must have nonzero area and no duplicate or intersecting edges: " + region.name);
+    } else {
+      require(false, "unknown blind region shape '" + shape + "': " + region.name);
+    }
     require(std::isfinite(region.hold_seconds) &&
       (region.hold_seconds >= 0.0 || region.hold_seconds == -1.0),
       "hold_seconds must be -1 or finite and nonnegative: " + region.name);
@@ -643,7 +770,10 @@ double RegionAwareDecayLayer::holdingTime(
   }
   for (size_t r = 0; r < blind_regions_.size(); ++r) {
     const auto & region = blind_regions_[r];
-    if (x < region.x_min || x > region.x_max || y < region.y_min || y > region.y_max) {
+    const bool contains = region.points.empty() ?
+      x >= region.x_min && x <= region.x_max && y >= region.y_min && y <= region.y_max :
+      polygonContains(region.points, x, y);
+    if (!contains) {
       continue;
     }
     double region_hold = region.hold_seconds;

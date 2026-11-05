@@ -41,6 +41,7 @@
 #ifndef NAV2_COSTMAP_2D__REGION_AWARE_DECAY_LAYER_HPP_
 #define NAV2_COSTMAP_2D__REGION_AWARE_DECAY_LAYER_HPP_
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -139,6 +140,9 @@ protected:
   {
     std::string name;
     double x_min, x_max, y_min, y_max, hold_seconds;
+    // Empty for legacy rectangles; otherwise a simple, unclosed polygon in
+    // robot coordinates. Clockwise and counterclockwise vertices are accepted.
+    std::vector<std::array<double, 2>> points;
   };
 
   std::vector<std::shared_ptr<ObservationBufferWithBase>> observation_buffers_;

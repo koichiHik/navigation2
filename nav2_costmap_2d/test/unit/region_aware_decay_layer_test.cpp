@@ -11,6 +11,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -87,6 +88,18 @@ Parameters region(
     rclcpp::Parameter(prefix + "x_max", x_max),
     rclcpp::Parameter(prefix + "y_min", y_min),
     rclcpp::Parameter(prefix + "y_max", y_max),
+    rclcpp::Parameter(prefix + "hold_seconds", hold_seconds)};
+}
+
+Parameters polygonRegion(
+  double hold_seconds, const std::vector<double> & points,
+  const std::string & name = "rear")
+{
+  const std::string prefix = "obstacles.blind_region." + name + ".";
+  return {
+    rclcpp::Parameter("obstacles.blind_region_names", std::vector<std::string>{name}),
+    rclcpp::Parameter(prefix + "shape", "polygon"),
+    rclcpp::Parameter(prefix + "points", points),
     rclcpp::Parameter(prefix + "hold_seconds", hold_seconds)};
 }
 
@@ -183,6 +196,11 @@ protected:
     // All transforms are supplied synchronously by the fixture; no listener
     // thread or executor is needed to satisfy these deterministic lookups.
     tf_->setUsingDedicatedThread(true);
+    initializeLayer(rolling, track_unknown);
+  }
+
+  void initializeLayer(bool rolling = true, bool track_unknown = false)
+  {
     map_ = std::make_unique<LayeredCostmap>("map", rolling, track_unknown);
     map_->resizeMap(200, 200, 0.05, 0.0, 0.0);
     map_->setFootprint(rectangularFootprint());
@@ -765,6 +783,132 @@ TEST_F(RegionAwareDecayLayerTest, BlindRegionUsesCellCenterRatherThanPartialCell
   EXPECT_EQ(FREE_SPACE, obstacleCost());
 }
 
+TEST_F(RegionAwareDecayLayerTest, SlantedPolygonIncludesItsEdgeInEitherWinding)
+{
+  const std::vector<XYZ> points{obstacle(), {{3.725f, 3.225f, 0.5f}},
+    {{3.225f, 3.725f, 0.5f}}};
+  for (const std::vector<double> & vertices : {
+      std::vector<double>{-2.0, -2.0, -1.0, -2.0, -1.0, -1.0},
+      std::vector<double>{-1.0, -1.0, -1.0, -2.0, -2.0, -2.0}})
+  {
+    configure(polygonRegion(-1.0, vertices));
+    receiveMessage(cloud(99900, points));
+    update();
+    receive(99950, true);
+    update();
+    EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());  // Exactly on the slanted edge.
+    EXPECT_EQ(LETHAL_OBSTACLE, costAt(3.725, 3.225));
+    EXPECT_EQ(FREE_SPACE, costAt(3.225, 3.725));  // Inside the AABB, outside the triangle.
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, PolygonIncludesVerticesAndHorizontalEdges)
+{
+  // Obtain exact cell centers, rather than assuming decimal coordinates are
+  // exactly representable after world-to-robot subtraction.
+  unsigned int mx = 0, my = 0;
+  ASSERT_TRUE(map_->getCostmap()->worldToMap(obstacle()[0], obstacle()[1], mx, my));
+  double x, y;
+  map_->getCostmap()->mapToWorld(mx, my, x, y);
+  x -= 5.0;
+  y -= 5.0;
+  for (const std::vector<double> & vertices : {
+      std::vector<double>{x, y, x + 1.0, y, x, y + 1.0},
+      std::vector<double>{x - 0.5, y, x + 0.5, y, x, y + 1.0}})
+  {
+    configure(polygonRegion(-1.0, vertices), false);
+    initializeObstacle();
+    receive(99950, true);
+    update();
+    EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, ConcavePolygonDoesNotRetainItsNotch)
+{
+  configure(polygonRegion(-1.0,
+    {-2.0, -2.0, -1.0, -2.0, -1.0, -1.5, -1.5, -1.5, -1.5, -1.0, -2.0, -1.0}));
+  receiveMessage(cloud(99900,
+    {obstacle(), {{3.225f, 3.725f, 0.5f}}, {{3.725f, 3.725f, 0.5f}}}));
+  update();
+  receive(99950, true);
+  update();
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  EXPECT_EQ(LETHAL_OBSTACLE, costAt(3.225, 3.725));
+  EXPECT_EQ(FREE_SPACE, costAt(3.725, 3.725));
+}
+
+TEST_F(RegionAwareDecayLayerTest, PolygonUsesCellCenterRatherThanPartialCellOverlap)
+{
+  configure(polygonRegion(-1.0,
+    {-1.79, -1.9, -1.78, -1.9, -1.78, -1.6, -1.79, -1.6}));
+  initializeObstacle();
+  receive(99950, true);
+  update();
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+}
+
+TEST_F(RegionAwareDecayLayerTest, PolygonFollowsRobotTranslationAndYaw)
+{
+  for (bool rotate : {false, true}) {
+    configure(polygonRegion(-1.0, {-2.0, -2.0, -1.0, -2.0, -1.0, -1.0}));
+    initializeObstacle();
+    receive(99950, true);
+    update();
+    ASSERT_EQ(LETHAL_OBSTACLE, obstacleCost());
+    const double robot_x = rotate ? 5.0 : 3.0;
+    const double robot_yaw = rotate ? std::acos(-1.0) / 2.0 : 0.0;
+    update(robot_x, 5.0, robot_yaw);
+    EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+    receive(99975, true);
+    update(robot_x, 5.0, robot_yaw);
+    EXPECT_EQ(FREE_SPACE, obstacleCost());
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, PolygonRectangleOverlapUsesLongestHoldAndInfinity)
+{
+  for (double longer : {0.5, -1.0}) {
+    auto parameters = region(0.0, "short");
+    append(parameters, polygonRegion(longer,
+      {-2.0, -2.0, -1.0, -2.0, -1.0, -1.0}, "long"));
+    append(parameters, {rclcpp::Parameter("obstacles.blind_region_names",
+      std::vector<std::string>{"short", "long"})});
+    configure(parameters);
+    initializeObstacle();
+    receive(99950, true);
+    update();
+    EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+    setTime(100500);
+    receive(100490, true);
+    update();
+    EXPECT_EQ(longer < 0.0 ? LETHAL_OBSTACLE : FREE_SPACE, obstacleCost());
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, PolygonRectangleOverlapPreservesAdaptiveHold)
+{
+  auto parameters = adaptivePersistence(1.0, 0.5);
+  append(parameters, region(0.4, "short"));
+  append(parameters, polygonRegion(2.0,
+    {-2.0, -2.0, -1.0, -2.0, -1.0, -1.0}, "long"));
+  append(parameters, {rclcpp::Parameter("obstacles.blind_region_names",
+    std::vector<std::string>{"short", "long"})});
+  configure(parameters);
+  initializeObstacle();
+  ASSERT_EQ(2u, deadlines().size());
+  EXPECT_NEAR(100000000000LL, deadlines()[0], 2.0);
+  EXPECT_NEAR(100400000000LL, deadlines()[1], 2.0);
+  setTime(100200);
+  receive(100190, true);
+  update();
+  EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+  setTime(100450);
+  receive(100440, true);
+  update();
+  EXPECT_EQ(FREE_SPACE, obstacleCost());
+}
+
 TEST_F(RegionAwareDecayLayerTest, BaseLinkCloudIsTransformedExactlyOnceAndRemainsWorldFixed)
 {
   configure(region(-1.0, "all", -100.0, 100.0, -100.0, 100.0));
@@ -1244,6 +1388,91 @@ TEST_F(RegionAwareDecayLayerTest, InvalidParametersAreRejectedAtInitialization)
   for (size_t i = 0; i < invalid.size(); ++i) {
     SCOPED_TRACE(i);
     EXPECT_ANY_THROW(configure(invalid[i]));
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, InvalidPolygonGeometryIsRejectedAtInitialization)
+{
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double infinity = std::numeric_limits<double>::infinity();
+  const std::vector<std::vector<double>> invalid{
+    {}, {0.0, 0.0, 1.0, 0.0}, {0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0},
+    {0.0, 0.0, 1.0, 0.0, nan, 1.0},
+    {0.0, 0.0, 1.0, 0.0, 1.0, infinity},
+    {0.0, 0.0, 1.0, 0.0, 2.0, 0.0},  // Zero area.
+    {0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0},  // Duplicate edge endpoint.
+    {0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0},  // Repeated closing vertex.
+    {0.0, 0.0, 2.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0},  // Backtracking.
+    {0.0, 0.0, 3.0, 3.0, 0.0, 2.0, 2.0, 0.0},  // Crossing, nonzero signed area.
+    {0.0, 0.0, 2.0, 0.0, 2.0, 2.0, 1.0, 0.0, 0.0, 2.0},  // Touching an edge.
+    {0.0, 0.0, 2.0, 0.0, 2.0, 2.0, 0.0, 0.0, 0.0, 2.0}};  // Repeated vertex.
+  for (size_t i = 0; i < invalid.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_THROW(configure(polygonRegion(1.0, invalid[i])), std::invalid_argument);
+  }
+}
+
+TEST_F(RegionAwareDecayLayerTest, ShapeAndGeometryMustBeUnambiguous)
+{
+  const std::vector<double> triangle{0.0, 0.0, 1.0, 0.0, 0.0, 1.0};
+  for (const std::string shape : {"Polygon", "rotated_rectangle", ""}) {
+    auto parameters = polygonRegion(1.0, triangle);
+    append(parameters, {rclcpp::Parameter("obstacles.blind_region.rear.shape", shape)});
+    EXPECT_THROW(configure(parameters), std::invalid_argument);
+  }
+  for (const std::vector<double> & points : {std::vector<double>{}, triangle}) {
+    auto parameters = region(1.0);
+    append(parameters, {rclcpp::Parameter("obstacles.blind_region.rear.points", points)});
+    EXPECT_THROW(configure(parameters), std::invalid_argument);
+  }
+  for (const std::string key : {"x_min", "x_max", "y_min", "y_max"}) {
+    auto parameters = polygonRegion(1.0, triangle);
+    append(parameters, {rclcpp::Parameter("obstacles.blind_region.rear." + key,
+      std::numeric_limits<double>::quiet_NaN())});
+    EXPECT_THROW(configure(parameters), std::invalid_argument);
+  }
+  auto missing_points = polygonRegion(1.0, triangle);
+  missing_points.erase(missing_points.begin() + 2);
+  EXPECT_THROW(configure(missing_points), std::invalid_argument);
+
+  auto integer_points = polygonRegion(1.0, triangle);
+  append(integer_points, {rclcpp::Parameter("obstacles.blind_region.rear.points",
+    std::vector<int64_t>{0, 0, 1, 0, 0, 1})});
+  EXPECT_ANY_THROW(configure(integer_points));
+
+  auto explicit_rectangle = region(1.0);
+  append(explicit_rectangle, {rclcpp::Parameter("obstacles.blind_region.rear.shape", "rectangle")});
+  EXPECT_NO_THROW(configure(explicit_rectangle));
+}
+
+TEST_F(RegionAwareDecayLayerTest, PolygonAcceptsStraightConsecutiveEdgesAndLargeFiniteCoordinates)
+{
+  // Collinear consecutive edges are valid when they continue in one direction.
+  EXPECT_NO_THROW(configure(polygonRegion(1.0,
+    {0.0, 0.0, 0.5, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0})));
+  EXPECT_NO_THROW(configure(polygonRegion(1.0,
+    {-1e200, -1e200, 1e200, -1e200, 1e200, 1e200, -1e200, 1e200})));
+}
+
+TEST_F(RegionAwareDecayLayerTest, GeometryCanBeRecreatedOnTheSameLifecycleNode)
+{
+  for (const auto & parameters : {
+      region(-1.0),
+      polygonRegion(-1.0, {-2.0, -2.0, -1.0, -2.0, -1.0, -1.0})})
+  {
+    configure(parameters);
+    const auto original_node = node_;
+    for (int instance = 0; instance < 2; ++instance) {
+      initializeObstacle();
+      receive(99950, true);
+      update();
+      EXPECT_EQ(LETHAL_OBSTACLE, obstacleCost());
+      layer_->deactivate();
+      map_.reset();
+      layer_.reset();
+      ASSERT_NO_THROW(initializeLayer());
+      EXPECT_EQ(original_node, node_);
+    }
   }
 }
 
