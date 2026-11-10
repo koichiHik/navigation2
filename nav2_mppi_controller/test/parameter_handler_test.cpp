@@ -145,6 +145,37 @@ TEST(ParameterHandlerTest, GetSystemParamsTest)
   EXPECT_EQ(p2, 7);
 }
 
+TEST(ParameterHandlerTest, IgnoresUnregisteredParameterUpdates)
+{
+  ParametersHandlerWrapper handler;
+  int before = 0, after = 0, own_value = 0;
+  handler.addPreCallback([&]() {++before;});
+  handler.addPostCallback([&]() {++after;});
+  handler.setDynamicParamCallback(own_value, "mppic.batch_size");
+
+  auto result = handler.dynamicParamsCallback(
+    {rclcpp::Parameter("goal_checker.trans_stopped_velocity", 0.01),
+      rclcpp::Parameter("mppic_other.batch_size", 32)});
+  EXPECT_TRUE(result.successful);
+  EXPECT_EQ(before, 0);
+  EXPECT_EQ(after, 0);
+  EXPECT_EQ(own_value, 0);
+
+  // A mixed atomic update processes the registered MPPI change exactly once.
+  result = handler.dynamicParamsCallback(
+    {rclcpp::Parameter("goal_checker.trans_stopped_velocity", 0.02),
+      rclcpp::Parameter("mppic.batch_size", 16)});
+  EXPECT_TRUE(result.successful);
+  EXPECT_EQ(before, 1);
+  EXPECT_EQ(after, 1);
+  EXPECT_EQ(own_value, 16);
+
+  result = handler.dynamicParamsCallback({});
+  EXPECT_TRUE(result.successful);
+  EXPECT_EQ(before, 1);
+  EXPECT_EQ(after, 1);
+}
+
 TEST(ParameterHandlerTest, DynamicAndStaticParametersTest)
 {
   auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("my_node");

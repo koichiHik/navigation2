@@ -46,6 +46,36 @@ bool isValidMaxAngularVel(double value)
 {
   return value == -1.0 || (std::isfinite(value) && value > 0.0);
 }
+
+double yawDifference(
+  const geometry_msgs::msg::Quaternion & from,
+  const geometry_msgs::msg::Quaternion & to)
+{
+  const double difference = tf2::getYaw(to) - tf2::getYaw(from);
+  return std::atan2(std::sin(difference), std::cos(difference));
+}
+
+// Ignore repeated positions when locating the next change of travel direction.
+size_t firstInversion(const nav_msgs::msg::Path & path, size_t start)
+{
+  double previous_dx = 0.0;
+  double previous_dy = 0.0;
+  bool have_direction = false;
+  for (size_t i = start; i + 1 < path.poses.size(); ++i) {
+    const double dx = path.poses[i + 1].pose.position.x - path.poses[i].pose.position.x;
+    const double dy = path.poses[i + 1].pose.position.y - path.poses[i].pose.position.y;
+    if (std::hypot(dx, dy) <= 1e-4) {
+      continue;
+    }
+    if (have_direction && previous_dx * dx + previous_dy * dy < 0.0) {
+      return i;
+    }
+    previous_dx = dx;
+    previous_dy = dy;
+    have_direction = true;
+  }
+  return path.poses.size();
+}
 }  // namespace
 
 void RegulatedPurePursuitController::configure(
@@ -124,6 +154,12 @@ void RegulatedPurePursuitController::configure(
   declare_parameter_if_not_declared(
     node, plugin_name_ + ".allow_reversing", rclcpp::ParameterValue(false));
   declare_parameter_if_not_declared(
+    node, plugin_name_ + ".enforce_path_inversion", rclcpp::ParameterValue(false));
+  declare_parameter_if_not_declared(
+    node, plugin_name_ + ".inversion_xy_tolerance", rclcpp::ParameterValue(0.2));
+  declare_parameter_if_not_declared(
+    node, plugin_name_ + ".inversion_yaw_tolerance", rclcpp::ParameterValue(0.4));
+  declare_parameter_if_not_declared(
     node, plugin_name_ + ".max_robot_pose_search_dist",
     rclcpp::ParameterValue(getCostmapMaxExtent()));
   declare_parameter_if_not_declared(
@@ -186,6 +222,15 @@ void RegulatedPurePursuitController::configure(
   node->get_parameter(plugin_name_ + ".rotate_to_heading_min_angle", rotate_to_heading_min_angle_);
   node->get_parameter(plugin_name_ + ".max_angular_accel", max_angular_accel_);
   node->get_parameter(plugin_name_ + ".allow_reversing", allow_reversing_);
+  node->get_parameter(plugin_name_ + ".enforce_path_inversion", enforce_path_inversion_);
+  node->get_parameter(plugin_name_ + ".inversion_xy_tolerance", inversion_xy_tolerance_);
+  node->get_parameter(plugin_name_ + ".inversion_yaw_tolerance", inversion_yaw_tolerance_);
+  for (double tolerance : {inversion_xy_tolerance_, inversion_yaw_tolerance_}) {
+    if (!std::isfinite(tolerance) || tolerance < 0.0) {
+      throw std::invalid_argument("Path inversion tolerances must be finite and nonnegative");
+    }
+  }
+  path_progress_ = PathProgress{};
   node->get_parameter("controller_frequency", control_frequency);
   node->get_parameter(
     plugin_name_ + ".max_robot_pose_search_dist",
@@ -213,6 +258,9 @@ void RegulatedPurePursuitController::configure(
       "parameter cannot be set to true. By default setting use_rotate_to_heading true");
     allow_reversing_ = false;
   }
+  if (enforce_path_inversion_ && !allow_reversing_) {
+    throw std::invalid_argument("enforce_path_inversion requires allow_reversing");
+  }
 
   global_path_pub_ = node->create_publisher<nav_msgs::msg::Path>("received_global_plan", 1);
   carrot_pub_ = node->create_publisher<geometry_msgs::msg::PointStamped>("lookahead_point", 1);
@@ -226,6 +274,7 @@ void RegulatedPurePursuitController::configure(
 
 void RegulatedPurePursuitController::cleanup()
 {
+  path_progress_ = PathProgress{};
   RCLCPP_INFO(
     logger_,
     "Cleaning up controller: %s of type"
@@ -303,7 +352,8 @@ geometry_msgs::msg::TwistStamped RegulatedPurePursuitController::computeVelocity
 
   goal_dist_tol_ = goalDistanceTolerance(goal_checker);
   auto evaluation = evaluateTransformedPlan(
-    transformPlan(global_plan_, pose), pose, speed, desired_linear_vel_, goal_dist_tol_);
+    transformPlan(global_plan_, pose, &path_progress_), pose, speed,
+    desired_linear_vel_, goal_dist_tol_);
   publishEvaluation(evaluation);
   if (evaluation.collision_detected) {
     throw CollisionDetected("RegulatedPurePursuitController detected collision ahead!");
@@ -323,8 +373,9 @@ VelocityCommandEvaluation RegulatedPurePursuitController::evaluateVelocityComman
     throw nav2_core::PlannerException("Invalid candidate speed limit");
   }
   auto candidate_plan = plan;
+  PathProgress candidate_progress;
   return evaluateTransformedPlan(
-    transformPlan(candidate_plan, pose), pose, speed, speed_limit,
+    transformPlan(candidate_plan, pose, &candidate_progress), pose, speed, speed_limit,
     goalDistanceTolerance(goal_checker));
 }
 
@@ -766,7 +817,9 @@ void RegulatedPurePursuitController::applyConstraints(
 
 void RegulatedPurePursuitController::setPlan(const nav_msgs::msg::Path & path)
 {
+  std::lock_guard<std::mutex> lock_reinit(mutex_);
   global_plan_ = path;
+  path_progress_ = PathProgress{};
 }
 
 void RegulatedPurePursuitController::setSpeedLimit(
@@ -790,14 +843,19 @@ void RegulatedPurePursuitController::setSpeedLimit(
 nav_msgs::msg::Path RegulatedPurePursuitController::transformGlobalPlan(
   const geometry_msgs::msg::PoseStamped & pose)
 {
-  auto transformed_plan = transformPlan(global_plan_, pose);
+  auto transformed_plan = transformPlan(global_plan_, pose, &path_progress_);
   global_path_pub_->publish(transformed_plan);
   return transformed_plan;
 }
 
 nav_msgs::msg::Path RegulatedPurePursuitController::transformPlan(
-  nav_msgs::msg::Path & plan, const geometry_msgs::msg::PoseStamped & pose)
+  nav_msgs::msg::Path & plan, const geometry_msgs::msg::PoseStamped & pose,
+  PathProgress * progress)
 {
+  if (enforce_path_inversion_) {
+    PathProgress local_progress;
+    return transformInversionPlan(plan, pose, progress ? *progress : local_progress);
+  }
   if (plan.poses.empty()) {
     throw nav2_core::PlannerException("Received plan with zero length");
   }
@@ -824,6 +882,18 @@ nav_msgs::msg::Path RegulatedPurePursuitController::transformPlan(
     [&robot_pose](const geometry_msgs::msg::PoseStamped & ps) {
       return euclidean_distance(robot_pose, ps);
     });
+
+  // PR #3934 selects the last equally close pose to pass an in-place rotation.
+  // Keep this local to reversing paths; ordinary forward tracking keeps its tie behavior.
+  if (allow_reversing_) {
+    for (auto it = transformation_begin; it != closest_pose_upper_bound; ++it) {
+      if (euclidean_distance(robot_pose, *it) <=
+        euclidean_distance(robot_pose, *transformation_begin))
+      {
+        transformation_begin = it;
+      }
+    }
+  }
 
   // Find points up to max_transform_dist so we only transform them.
   auto transformation_end = std::find_if(
@@ -863,30 +933,106 @@ nav_msgs::msg::Path RegulatedPurePursuitController::transformPlan(
   return transformed_plan;
 }
 
+nav_msgs::msg::Path RegulatedPurePursuitController::transformInversionPlan(
+  const nav_msgs::msg::Path & plan, const geometry_msgs::msg::PoseStamped & pose,
+  PathProgress & progress)
+{
+  if (plan.poses.empty()) {
+    throw nav2_core::PlannerException("Received plan with zero length");
+  }
+  geometry_msgs::msg::PoseStamped robot_pose;
+  if (!transformPose(plan.header.frame_id, pose, robot_pose)) {
+    throw nav2_core::PlannerException("Unable to transform robot pose into global plan's frame");
+  }
+
+  auto next_progress = progress;
+  const size_t last = plan.poses.size() - 1;
+  next_progress.segment_start = std::min(next_progress.segment_start, last);
+  next_progress.closest_pose = std::max(
+    next_progress.segment_start, std::min(next_progress.closest_pose, last));
+  auto inversion = firstInversion(plan, next_progress.segment_start);
+  if (inversion != plan.poses.size()) {
+    const auto & cusp = plan.poses[inversion].pose;
+    const double distance = euclidean_distance(robot_pose.pose, cusp);
+    const double yaw_error = std::abs(yawDifference(robot_pose.pose.orientation, cusp.orientation));
+    if (distance <= inversion_xy_tolerance_ && yaw_error <= inversion_yaw_tolerance_)
+    {
+      // Release one constraint at a time, only after reaching its position and heading.
+      next_progress.segment_start = inversion;
+      next_progress.closest_pose = inversion;
+      inversion = firstInversion(plan, inversion);
+    }
+  }
+  if (inversion != plan.poses.size()) {
+    const auto & cusp = plan.poses[inversion].pose;
+    const double distance = euclidean_distance(robot_pose.pose, cusp);
+    // At this distance the pursuit curvature is zeroed (see evaluateTransformedPlan).
+    // Check the pending cusp even when the previous inversion was released just above.
+    if (distance * distance <= 0.001 &&
+      std::abs(yawDifference(robot_pose.pose.orientation, cusp.orientation)) >
+      inversion_yaw_tolerance_)
+    {
+      throw nav2_core::PlannerException("Cannot align heading at path inversion cusp");
+    }
+  }
+
+  const size_t segment_end = inversion == plan.poses.size() ? last : inversion;
+  auto segment_begin = plan.poses.begin() + next_progress.closest_pose;
+  auto segment_limit = plan.poses.begin() + segment_end + 1;
+  auto search_limit = nav2_util::geometry_utils::first_after_integrated_distance(
+    segment_begin, segment_limit, max_robot_pose_search_dist_);
+  auto closest = segment_begin;
+  for (auto it = segment_begin; it != search_limit; ++it) {
+    // Last tie wins within this segment, never on a later reversing segment.
+    if (euclidean_distance(robot_pose, *it) <= euclidean_distance(robot_pose, *closest)) {
+      closest = it;
+    }
+  }
+
+  nav_msgs::msg::Path transformed_plan;
+  transformed_plan.header.frame_id = costmap_ros_->getBaseFrameID();
+  transformed_plan.header.stamp = robot_pose.header.stamp;
+  const double max_costmap_extent = getCostmapMaxExtent();
+  for (auto it = closest; it != segment_limit; ++it) {
+    if (euclidean_distance(*it, robot_pose) > max_costmap_extent) {
+      break;
+    }
+    auto stamped_pose = *it;
+    stamped_pose.header = plan.header;
+    stamped_pose.header.stamp = robot_pose.header.stamp;
+    geometry_msgs::msg::PoseStamped transformed_pose;
+    if (!transformPose(costmap_ros_->getBaseFrameID(), stamped_pose, transformed_pose)) {
+      throw nav2_core::PlannerException("Unable to transform plan pose into robot's frame");
+    }
+    transformed_pose.pose.position.z = 0.0;
+    transformed_plan.poses.push_back(transformed_pose);
+  }
+  if (transformed_plan.poses.empty()) {
+    throw nav2_core::PlannerException("Resulting plan has 0 poses in it.");
+  }
+  next_progress.closest_pose = std::distance(plan.poses.begin(), closest);
+  progress = next_progress;
+  return transformed_plan;
+}
+
 double RegulatedPurePursuitController::findVelocitySignChange(
   const nav_msgs::msg::Path & transformed_plan)
 {
-  // Iterating through the transformed global path to determine the position of the cusp
-  for (unsigned int pose_id = 1; pose_id < transformed_plan.poses.size() - 1; ++pose_id) {
-    // We have two vectors for the dot product OA and AB. Determining the vectors.
-    double oa_x = transformed_plan.poses[pose_id].pose.position.x -
-      transformed_plan.poses[pose_id - 1].pose.position.x;
-    double oa_y = transformed_plan.poses[pose_id].pose.position.y -
-      transformed_plan.poses[pose_id - 1].pose.position.y;
-    double ab_x = transformed_plan.poses[pose_id + 1].pose.position.x -
-      transformed_plan.poses[pose_id].pose.position.x;
-    double ab_y = transformed_plan.poses[pose_id + 1].pose.position.y -
-      transformed_plan.poses[pose_id].pose.position.y;
-
-    /* Checking for the existance of cusp, in the path, using the dot product
-    and determine it's distance from the robot. If there is no cusp in the path,
-    then just determine the distance to the goal location. */
-    if ( (oa_x * ab_x) + (oa_y * ab_y) < 0.0) {
-      // returning the distance if there is a cusp
-      // The transformed path is in the robots frame, so robot is at the origin
-      return hypot(
-        transformed_plan.poses[pose_id].pose.position.x,
-        transformed_plan.poses[pose_id].pose.position.y);
+  const auto inversion = firstInversion(transformed_plan, 0);
+  for (size_t i = 0; i < transformed_plan.poses.size(); ++i) {
+    const auto & current = transformed_plan.poses[i].pose;
+    if (i == inversion) {
+      return std::hypot(current.position.x, current.position.y);
+    }
+    if (i + 1 < transformed_plan.poses.size()) {
+      const auto & next = transformed_plan.poses[i + 1].pose;
+      // Repeated XY with different yaw represents rotation, rather than an ordinary duplicate.
+      if (std::hypot(next.position.x - current.position.x,
+          next.position.y - current.position.y) <= 1e-4 &&
+        std::abs(yawDifference(current.orientation, next.orientation)) > 1e-6)
+      {
+        return std::hypot(current.position.x, current.position.y);
+      }
     }
   }
 
@@ -927,6 +1073,9 @@ RegulatedPurePursuitController::dynamicParametersCallback(
 {
   rcl_interfaces::msg::SetParametersResult result;
   std::lock_guard<std::mutex> lock_reinit(mutex_);
+  bool proposed_reversing = allow_reversing_;
+  bool proposed_rotation = use_rotate_to_heading_;
+  bool proposed_enforcement = enforce_path_inversion_;
 
   // Reject invalid limits before mutating any members in an atomic parameter update.
   for (const auto & parameter : parameters) {
@@ -939,6 +1088,42 @@ RegulatedPurePursuitController::dynamicParametersCallback(
         plugin_name_ + ".max_angular_vel must be -1.0 (disabled) or a finite positive double";
       return result;
     }
+    const auto & name = parameter.get_name();
+    if (name == plugin_name_ + ".enforce_path_inversion" &&
+      parameter.get_type() != ParameterType::PARAMETER_BOOL)
+    {
+      result.successful = false;
+      result.reason = "enforce_path_inversion must be a bool";
+      return result;
+    }
+    if (parameter.get_type() == ParameterType::PARAMETER_BOOL) {
+      if (name == plugin_name_ + ".enforce_path_inversion") {
+        proposed_enforcement = parameter.as_bool();
+      } else if (name == plugin_name_ + ".allow_reversing") {
+        proposed_reversing = parameter.as_bool();
+      } else if (name == plugin_name_ + ".use_rotate_to_heading") {
+        proposed_rotation = parameter.as_bool();
+      }
+    }
+    if ((parameter.get_name() == plugin_name_ + ".inversion_xy_tolerance" ||
+      parameter.get_name() == plugin_name_ + ".inversion_yaw_tolerance") &&
+      (parameter.get_type() != ParameterType::PARAMETER_DOUBLE ||
+      !std::isfinite(parameter.as_double()) || parameter.as_double() < 0.0))
+    {
+      result.successful = false;
+      result.reason = "Path inversion tolerances must be finite nonnegative doubles";
+      return result;
+    }
+  }
+  if (proposed_enforcement && proposed_rotation) {
+    result.successful = false;
+    result.reason = "enforce_path_inversion requires use_rotate_to_heading=false";
+    return result;
+  }
+  if (proposed_enforcement && !proposed_reversing) {
+    result.successful = false;
+    result.reason = "enforce_path_inversion requires allow_reversing";
+    return result;
   }
 
   for (auto parameter : parameters) {
@@ -988,6 +1173,10 @@ RegulatedPurePursuitController::dynamicParametersCallback(
         max_angular_accel_ = parameter.as_double();
       } else if (name == plugin_name_ + ".rotate_to_heading_min_angle") {
         rotate_to_heading_min_angle_ = parameter.as_double();
+      } else if (name == plugin_name_ + ".inversion_xy_tolerance") {
+        inversion_xy_tolerance_ = parameter.as_double();
+      } else if (name == plugin_name_ + ".inversion_yaw_tolerance") {
+        inversion_yaw_tolerance_ = parameter.as_double();
       }
     } else if (type == ParameterType::PARAMETER_BOOL) {
       if (name == plugin_name_ + ".use_velocity_scaled_lookahead_dist") {
@@ -997,6 +1186,9 @@ RegulatedPurePursuitController::dynamicParametersCallback(
       } else if (name == plugin_name_ + ".use_cost_regulated_linear_velocity_scaling") {
         use_cost_regulated_linear_velocity_scaling_ = parameter.as_bool();
       } else if (name == plugin_name_ + ".use_rotate_to_heading") {
+        if (proposed_enforcement) {
+          continue;  // Apply the validated enforcement-mode flags together below.
+        }
         if (parameter.as_bool() && allow_reversing_) {
           RCLCPP_WARN(
             logger_, "Both use_rotate_to_heading and allow_reversing "
@@ -1005,6 +1197,9 @@ RegulatedPurePursuitController::dynamicParametersCallback(
         }
         use_rotate_to_heading_ = parameter.as_bool();
       } else if (name == plugin_name_ + ".allow_reversing") {
+        if (proposed_enforcement) {
+          continue;
+        }
         if (use_rotate_to_heading_ && parameter.as_bool()) {
           RCLCPP_WARN(
             logger_, "Both use_rotate_to_heading and allow_reversing "
@@ -1014,6 +1209,15 @@ RegulatedPurePursuitController::dynamicParametersCallback(
         allow_reversing_ = parameter.as_bool();
       }
     }
+  }
+
+  if (proposed_enforcement) {
+    allow_reversing_ = proposed_reversing;
+    use_rotate_to_heading_ = proposed_rotation;
+  }
+  if (enforce_path_inversion_ != proposed_enforcement) {
+    enforce_path_inversion_ = proposed_enforcement;
+    path_progress_ = PathProgress{};
   }
 
   result.successful = true;

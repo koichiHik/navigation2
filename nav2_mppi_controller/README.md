@@ -2,7 +2,20 @@
 
 > Workspace source: official Nav2 `humble` commit
 > [`3c3db59d6969d8ecee8e68468693d006397f4a0c`](https://github.com/ros-navigation/navigation2/tree/3c3db59d6969d8ecee8e68468693d006397f4a0c/nav2_mppi_controller)
-> (package version 1.1.20). Source and tests match this revision; this provenance note is local.
+> (package version 1.1.20), with the focused local fixes described below.
+
+## Local Humble-compatible fixes
+
+The following fixes are adapted from official Nav2 `main`
+[`3b7ec4355be91ab32da850e9a77382300c1ca560`](https://github.com/ros-navigation/navigation2/tree/3b7ec4355be91ab32da850e9a77382300c1ca560/nav2_mppi_controller),
+while retaining Humble's controller interface, parameter callbacks, and xtensor implementation:
+
+- Only this controller's registered dynamic parameter changes trigger its pre/post callbacks and optimizer reset. Goal checker and other controller updates are ignored. The legacy unnamed parameter handler processes its registered dynamic parameters only.
+- Controller resets, idle resets, and fallback retries preserve an externally applied speed limit. Initialization, explicit `Optimizer::reset()`, and this controller's own dynamic parameter updates retain Humble's behavior of restoring the configured base limits; reapply an external limit after those operations when needed.
+- Fallback retry history belongs to each optimizer instance.
+- Absolute speed limits use `abs(vx_min)` when `vx_max` is zero. If both reference velocities are zero, the update is rejected and the current limits remain intact.
+
+These changes do not add main's newer controller API, motion models, or final optimized-trajectory validator. MPPI still requires the caller's motion validation before commands are used by the future recovery implementation.
 
 ![](media/demo.gif)
 

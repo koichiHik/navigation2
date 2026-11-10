@@ -85,6 +85,8 @@ void Optimizer::getParams()
 
   s.constraints = s.base_constraints;
   setMotionModel(motion_model_name);
+  // Keep the Humble behavior for this plugin's own dynamic parameter updates:
+  // reinitialize from the newly configured base constraints.
   parameters_handler_->addPostCallback([this]() {reset();});
 
   double controller_frequency;
@@ -115,6 +117,11 @@ void Optimizer::setOffset(double controller_frequency)
 
 void Optimizer::reset()
 {
+  reset(true);
+}
+
+void Optimizer::reset(bool reset_dynamic_speed_limits)
+{
   state_.reset(settings_.batch_size, settings_.time_steps);
   control_sequence_.reset(settings_.time_steps);
   control_history_[0] = {0.0, 0.0, 0.0};
@@ -122,7 +129,9 @@ void Optimizer::reset()
   control_history_[2] = {0.0, 0.0, 0.0};
   control_history_[3] = {0.0, 0.0, 0.0};
 
-  settings_.constraints = settings_.base_constraints;
+  if (reset_dynamic_speed_limits) {
+    settings_.constraints = settings_.base_constraints;
+  }
 
   costs_ = xt::zeros<float>({settings_.batch_size});
   generated_trajectories_.reset(settings_.batch_size, settings_.time_steps);
@@ -163,17 +172,15 @@ void Optimizer::optimize()
 
 bool Optimizer::fallback(bool fail)
 {
-  static size_t counter = 0;
-
   if (!fail) {
-    counter = 0;
+    fallback_count_ = 0;
     return false;
   }
 
-  reset();
+  reset(false);  // Retrying a trajectory must not remove an external speed limit.
 
-  if (++counter > settings_.retry_attempt_limit) {
-    counter = 0;
+  if (++fallback_count_ > settings_.retry_attempt_limit) {
+    fallback_count_ = 0;
     throw std::runtime_error("Optimizer fail to compute path");
   }
 
@@ -436,8 +443,17 @@ void Optimizer::setSpeedLimit(double speed_limit, bool percentage)
       s.constraints.vy = s.base_constraints.vy * ratio;
       s.constraints.wz = s.base_constraints.wz * ratio;
     } else {
-      // Speed limit is expressed in absolute value
-      double ratio = speed_limit / s.base_constraints.vx_max;
+      // Reverse-only configurations have no positive vx_max to scale against.
+      const float v_ref = s.base_constraints.vx_max != 0.0f ?
+        s.base_constraints.vx_max : std::fabs(s.base_constraints.vx_min);
+      if (v_ref == 0.0f) {
+        RCLCPP_ERROR(
+          logger_,
+          "Rejected absolute speed limit of %f m/s: vx_max and vx_min are both zero. "
+          "Keeping current constraints.", speed_limit);
+        return;
+      }
+      double ratio = speed_limit / v_ref;
       s.constraints.vx_max = s.base_constraints.vx_max * ratio;
       s.constraints.vx_min = s.base_constraints.vx_min * ratio;
       s.constraints.vy = s.base_constraints.vy * ratio;

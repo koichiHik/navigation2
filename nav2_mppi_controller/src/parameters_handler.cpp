@@ -19,11 +19,18 @@ namespace mppi
 
 ParametersHandler::ParametersHandler(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent)
+: ParametersHandler(parent, "")
+{
+}
+
+ParametersHandler::ParametersHandler(
+  const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent, const std::string & name)
 {
   node_ = parent;
   auto node = node_.lock();
   node_name_ = node->get_name();
   logger_ = node->get_logger();
+  name_ = name;
 }
 
 void ParametersHandler::start()
@@ -43,21 +50,37 @@ ParametersHandler::dynamicParamsCallback(
   std::vector<rclcpp::Parameter> parameters)
 {
   rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
   std::lock_guard<std::mutex> lock(parameters_change_mutex_);
+
+  std::vector<rclcpp::Parameter> plugin_params;
+  for (const auto & param : parameters) {
+    const auto & param_name = param.get_name();
+    if (!name_.empty() && param_name.find(name_ + ".") != 0) {
+      continue;
+    }
+    if (get_param_callbacks_.find(param_name) != get_param_callbacks_.end()) {
+      plugin_params.push_back(param);
+    }
+  }
+
+  // Parent nodes can also host goal checkers and other controllers. Only changes
+  // handled by this plugin should invalidate its optimizer state.
+  if (plugin_params.empty()) {
+    return result;
+  }
 
   for (auto & pre_cb : pre_callbacks_) {
     pre_cb();
   }
 
-  for (auto & param : parameters) {
+  for (auto & param : plugin_params) {
     const std::string & param_name = param.get_name();
 
     if (auto callback = get_param_callbacks_.find(param_name);
       callback != get_param_callbacks_.end())
     {
       callback->second(param);
-    } else {
-      RCLCPP_WARN(logger_, "Parameter %s not found", param_name.c_str());
     }
   }
 

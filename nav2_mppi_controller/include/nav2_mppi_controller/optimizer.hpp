@@ -120,6 +120,12 @@ public:
    */
   void reset();
 
+  /**
+   * @brief Reset the optimization problem, optionally retaining external speed limits
+   * @param reset_dynamic_speed_limits Whether to restore the base velocity constraints
+   */
+  void reset(bool reset_dynamic_speed_limits);
+
 protected:
   /**
    * @brief Main function to generate, score, and return trajectories
@@ -248,6 +254,7 @@ protected:
   NoiseGenerator noise_generator_;
 
   models::OptimizerSettings settings_;
+  size_t fallback_count_{0};
 
   models::State state_;
   models::ControlSequence control_sequence_;

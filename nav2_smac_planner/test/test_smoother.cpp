@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 #include <limits>
+#include <utility>
 
 #include "gtest/gtest.h"
 #include "rclcpp/rclcpp.hpp"
@@ -51,6 +52,70 @@ public:
     return findDirectionalPathSegments(path);
   }
 };
+
+TEST(SmootherTest, rejects_non_circular_footprint_collision)
+{
+  SmootherParams params;
+  params.tolerance_ = 2.0;
+  params.max_its_ = 1000;
+  params.w_data_ = 0.2;
+  params.w_smooth_ = 0.3;
+  params.do_refinement_ = false;
+  params.holonomic_ = false;
+  SmootherWrapper smoother(params);
+  smoother.initialize(0.4);
+
+  nav2_costmap_2d::Costmap2D costmap(
+    200, 200, 0.1, 0.0, 0.0, nav2_costmap_2d::FREE_SPACE);
+  nav2_costmap_2d::Footprint footprint;
+  for (const auto & coordinates : std::vector<std::pair<double, double>>{
+    {-0.6, -0.2}, {0.6, -0.2}, {0.6, 0.2}, {-0.6, 0.2}})
+  {
+    geometry_msgs::msg::Point point;
+    point.x = coordinates.first;
+    point.y = coordinates.second;
+    footprint.push_back(point);
+  }
+  // The original path clears this obstacle; pulling the corner inward rotates
+  // the long rectangular footprint into it while the center cell remains free.
+  costmap.setCost(31, 117, nav2_costmap_2d::LETHAL_OBSTACLE);
+  nav_msgs::msg::Path original;
+  geometry_msgs::msg::PoseStamped pose;
+  for (unsigned int i = 0; i <= 5; ++i) {
+    pose.pose.position.x = 2.0;
+    pose.pose.position.y = 2.0 + 2.0 * i;
+    pose.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(
+      i == 5 ? 0.0 : M_PI_2);
+    original.poses.push_back(pose);
+  }
+  for (unsigned int i = 1; i <= 6; ++i) {
+    pose.pose.position.x = 2.0 + 2.0 * i;
+    pose.pose.position.y = 12.0;
+    pose.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(0.0);
+    original.poses.push_back(pose);
+  }
+  nav2_costmap_2d::FootprintCollisionChecker<nav2_costmap_2d::Costmap2D *> checker(&costmap);
+  const auto collides = [&](const nav_msgs::msg::Path & path) {
+      for (const auto & stamped : path.poses) {
+        const auto & p = stamped.pose;
+        if (checker.footprintCostAtPose(p.position.x, p.position.y,
+            tf2::getYaw(p.orientation), footprint) >= nav2_costmap_2d::LETHAL_OBSTACLE)
+        {
+          return true;
+        }
+      }
+      return false;
+    };
+  ASSERT_FALSE(collides(original));
+
+  auto center_only = original;
+  ASSERT_TRUE(smoother.smooth(center_only, &costmap, 1.0));
+  EXPECT_TRUE(collides(center_only));
+
+  auto footprint_checked = original;
+  EXPECT_FALSE(smoother.smooth(footprint_checked, &costmap, 1.0, footprint));
+  EXPECT_FALSE(collides(footprint_checked));
+}
 
 TEST(SmootherTest, test_full_smoother)
 {

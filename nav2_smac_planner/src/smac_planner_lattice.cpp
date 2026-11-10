@@ -19,6 +19,7 @@
 #include <limits>
 
 #include "Eigen/Core"
+#include "nav2_core/exceptions.hpp"
 #include "nav2_smac_planner/smac_planner_lattice.hpp"
 
 // #define BENCHMARK_TESTING
@@ -251,14 +252,18 @@ nav_msgs::msg::Path SmacPlannerLattice::createPlan(
 
   // Set starting point, in A* bin search coordinates
   unsigned int mx_start, my_start, mx_goal, my_goal;
-  _costmap->worldToMap(start.pose.position.x, start.pose.position.y, mx_start, my_start);
+  if (!_costmap->worldToMap(start.pose.position.x, start.pose.position.y, mx_start, my_start)) {
+    throw nav2_core::PlannerException("Start pose is outside the Costmap bounds");
+  }
   unsigned int start_bin =
     NodeLattice::motion_table.getClosestAngularBin(tf2::getYaw(start.pose.orientation));
   _a_star->setStart(
     mx_start, my_start, start_bin);
 
   // Set goal point, in A* bin search coordinates
-  _costmap->worldToMap(goal.pose.position.x, goal.pose.position.y, mx_goal, my_goal);
+  if (!_costmap->worldToMap(goal.pose.position.x, goal.pose.position.y, mx_goal, my_goal)) {
+    throw nav2_core::PlannerException("Goal pose is outside the Costmap bounds");
+  }
   unsigned int goal_bin =
     NodeLattice::motion_table.getClosestAngularBin(tf2::getYaw(goal.pose.orientation));
   _a_star->setGoal(
@@ -357,7 +362,10 @@ nav_msgs::msg::Path SmacPlannerLattice::createPlan(
 
   // Smooth plan
   if (_smoother && num_iterations > 1) {
-    _smoother->smooth(plan, _costmap, time_remaining);
+    _smoother->smooth(
+      plan, _costmap, time_remaining,
+      _costmap_ros->getUseRadius() ? std::vector<geometry_msgs::msg::Point>() :
+      _costmap_ros->getRobotFootprint());
   }
 
 #ifdef BENCHMARK_TESTING

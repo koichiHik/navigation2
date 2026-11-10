@@ -58,6 +58,14 @@ public:
     const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent);
 
   /**
+    * @brief Constructor for parameters belonging to one controller plugin
+    * @param parent Weak ptr to node
+    * @param name Controller plugin namespace
+    */
+  ParametersHandler(
+    const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent, const std::string & name);
+
+  /**
     * @brief Starts processing dynamic parameter changes
     */
   void start();
@@ -152,6 +160,7 @@ protected:
     on_set_param_handler_;
   rclcpp_lifecycle::LifecycleNode::WeakPtr node_;
   std::string node_name_;
+  std::string name_;
 
   bool verbose_{false};
 

@@ -31,7 +31,7 @@ void MPPIController::configure(
   costmap_ros_ = costmap_ros;
   tf_buffer_ = tf;
   name_ = name;
-  parameters_handler_ = std::make_unique<ParametersHandler>(parent);
+  parameters_handler_ = std::make_unique<ParametersHandler>(parent, name_);
 
   auto node = parent_.lock();
   clock_ = node->get_clock();
@@ -74,7 +74,7 @@ void MPPIController::deactivate()
 
 void MPPIController::reset()
 {
-  optimizer_.reset();
+  optimizer_.reset(false);  // Keep external speed limits between requests.
 }
 
 geometry_msgs::msg::TwistStamped MPPIController::computeVelocityCommands(

@@ -24,6 +24,28 @@ Rotation to heading reduces commanded angular speed according to the remaining a
 
 Both `computeVelocityCommands()` and `evaluateVelocityCommands()` hold the Costmap mutex while evaluating a command. They acquire the recursive Costmap mutex before the controller mutex, matching PlannerMgmt's outer locking order and allowing calls while the caller already holds the Costmap lock. Candidate evaluation continues to leave the adopted plan, speed limit, and goal tolerance unchanged.
 
+### Selected main-branch path fixes
+
+The rotation-cusp detection from [Nav2 PR #3934](https://github.com/ros-navigation/navigation2/pull/3934) is adapted locally: repeated XY positions with changed yaw are detected as a cusp, while repeated positions with the same yaw are ignored. Empty and short paths are handled without unsigned-index underflow. When reversing is enabled, the last equally close pose is selected locally so an in-place rotation's duplicate positions can be passed. The shared `nav2_util::min_by` implementation is unchanged, and ordinary forward tracking retains its existing tie behavior.
+
+Optional inversion enforcement follows the bounded-segment approach used in [PR #5446](https://github.com/ros-navigation/navigation2/pull/5446) and the [main-branch FeasiblePathHandler at `3b7ec435`](https://github.com/ros-navigation/navigation2/blob/3b7ec4355be91ab32da850e9a77382300c1ca560/nav2_controller/plugins/feasible_path_handler.cpp). This is a small Humble-compatible adaptation inside RPP, not a migration to main's controller or path-handler API.
+
+With `enforce_path_inversion: true`, nearest-pose search and the lookahead path stop at the first change in travel direction, including reversals separated by repeated positions. A geographically closer pose on a later reversing segment cannot be selected. The next segment is released only when both the robot's XY distance and shortest yaw difference from the cusp satisfy the configured tolerances. Search progress never moves backward within the adopted segment. Only one inversion is released per evaluation.
+
+Enforcement requires `allow_reversing: true` and `use_rotate_to_heading: false`; incompatible configuration is rejected after the existing rotate/reverse resolution. Dynamic updates validate the entire proposed enforcement-mode configuration before changing state, so reversing and enforcement can be enabled or disabled in the same atomic update in either order. The existing rotate/reverse update behavior is retained when enforcement remains disabled.
+
+At or extremely near a reversal cusp (squared XY distance at most `0.001 m²`, matching the pursuit curvature floor), a heading outside `inversion_yaw_tolerance` cannot be corrected by the pursuit calculation. Evaluation then throws `nav2_core::PlannerException` without advancing progress, rather than issuing the minimum forward speed past the cusp. Correcting the heading allows evaluation of the same plan to resume. Farther from the cusp, normal approach tracking remains available.
+
+The default is `false`. With `allow_reversing: false`, `use_rotate_to_heading: false`, and inversion enforcement disabled, normal tracking retains the previous command calculation and path pruning behavior; the repository's normal YAML lists these defaults explicitly. Enabling inversion enforcement changes path selection and approach-speed scaling near a cusp and should be configured for its own controller instance.
+
+`setPlan()` resets adopted path progress. Standard `computeVelocityCommands()` calls retain that progress; cleanup and changes to `enforce_path_inversion` reset it. Call `setPlan()` for a new or replaced path, rather than once per control cycle for the same path. Lifecycle transitions must remain serialized with controller use, as with the other lifecycle-owned resources.
+
+The additional progress members change the concrete controller's object layout. Rebuild direct clients such as PlannerMgmt against the updated header together with the plugin library.
+
+`evaluateVelocityCommands()` always uses fresh local progress and never changes the adopted path or its progress, including after failed evaluations. A caller tracking a multi-inversion path through this stateless API must supply its remaining active path; alternatively, use `setPlan()` and the standard command API to retain progress. Candidate order cannot advance another candidate or the adopted path.
+
+These fixes do not add an execution mode combining reversing with in-place rotation. The existing exclusion between `allow_reversing` and `use_rotate_to_heading` remains in force. Inversion yaw tolerance is a condition for advancing the path, not an additional rotate controller.
+
 ## Pure Pursuit Basics
 
 The Pure Pursuit algorithm has been in use for over 30 years. You can read more about the details of the pure pursuit controller in its [introduction paper](http://www.enseignement.polytechnique.fr/profs/informatique/Eric.Goubault/MRIS/coulter_r_craig_1992_1.pdf). The core idea is to find a point on the path in front of the robot and find the linear and angular velocity to help drive towards it. Once it moves forward, a new point is selected, and the process repeats until the end of the path. The distance used to find the point to drive towards is the `lookahead` distance. 
@@ -84,6 +106,9 @@ Note: The maximum allowed time to collision is thresholded by the lookahead poin
 | `rotate_to_heading_min_angle` | The difference in the path orientation and the starting robot orientation to trigger a rotate in place, if `use_rotate_to_heading` is enabled. | 
 | `max_angular_accel` | Maximum allowable angular acceleration while rotating to heading, if enabled | 
 | `max_robot_pose_search_dist` | Maximum integrated distance along the path to bound the search for the closest pose to the robot. This is set by default to the maximum costmap extent, so it shouldn't be set manually unless there are loops within the local costmap. | 
+| `enforce_path_inversion` | Bound nearest-pose search and lookahead to the active travel-direction segment. Defaults to `false`. Changing it resets adopted path progress. |
+| `inversion_xy_tolerance` | Maximum XY distance in meters from a reversal cusp before the next segment may be released. Defaults to `0.2`; requires a finite nonnegative value. |
+| `inversion_yaw_tolerance` | Maximum absolute shortest yaw difference in radians from the reversal cusp before the next segment may be released. Defaults to `0.4`; requires a finite nonnegative value. |
 | `use_interpolation` | Enables interpolation between poses on the path for lookahead point selection. Helps sparse paths to avoid inducing discontinuous commanded velocities. Set this to false for a potential performance boost, at the expense of smooth control. | 
 
 When `max_angular_vel` is enabled, commands exceeding the limit have their linear and angular velocities reduced by the same factor before collision checking. This preserves the commanded curvature and reversing direction. The angular limit takes precedence over minimum linear speeds and, when the current angular speed is already outside the limit, rotation-to-heading angular acceleration limits. It bounds commanded angular speed, not measured speed or tracking angular acceleration. The limit supports dynamic updates; invalid values are rejected.

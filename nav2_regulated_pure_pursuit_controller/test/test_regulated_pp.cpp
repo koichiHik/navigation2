@@ -209,6 +209,34 @@ TEST(RegulatedPurePursuitTest, findVelocitySignChange)
   EXPECT_EQ(rtn, std::numeric_limits<double>::max());
 }
 
+TEST(RegulatedPurePursuitTest, short_cusp_paths_and_rotation_duplicates)
+{
+  BasicAPIRPP controller;
+  nav_msgs::msg::Path path;
+  const auto no_cusp = std::numeric_limits<double>::max();
+  EXPECT_EQ(controller.findVelocitySignChangeWrapper(path), no_cusp);
+  geometry_msgs::msg::PoseStamped pose;
+  pose.pose.position.x = 1.0;
+  pose.pose.orientation.w = 1.0;
+  path.poses.push_back(pose);
+  EXPECT_EQ(controller.findVelocitySignChangeWrapper(path), no_cusp);
+  path.poses.push_back(pose);
+  EXPECT_EQ(controller.findVelocitySignChangeWrapper(path), no_cusp);
+
+  // Same XY and yaw is an ordinary duplicate. Changed yaw is an in-place rotation cusp.
+  path.poses.back().pose.orientation.z = std::sin(0.25);
+  path.poses.back().pose.orientation.w = std::cos(0.25);
+  EXPECT_DOUBLE_EQ(controller.findVelocitySignChangeWrapper(path), 1.0);
+  path.poses.back().pose.orientation = pose.pose.orientation;
+  path.poses.push_back(pose);
+  path.poses.back().pose.position.x = 2.0;
+  EXPECT_EQ(controller.findVelocitySignChangeWrapper(path), no_cusp);
+  path.poses.front().pose.position.x = 0.0;
+  path.poses.back().pose.position.x = 0.0;
+  path.poses.insert(path.poses.begin() + 2, pose);
+  EXPECT_DOUBLE_EQ(controller.findVelocitySignChangeWrapper(path), 1.0);
+}
+
 using CircleSegmentIntersectionParam = std::tuple<
   std::pair<double, double>,
   std::pair<double, double>,
@@ -1338,6 +1366,320 @@ protected:
     return path;
   }
 };
+
+class PathInversionTest : public AngularVelocityLimitTest
+{
+protected:
+  void SetUp() override
+  {
+    AngularVelocityLimitTest::SetUp();
+    // Declaring these explicitly also lets this test source run against the old implementation.
+    for (const auto & parameter : std::vector<rclcpp::Parameter>{
+        rclcpp::Parameter("test_rpp.enforce_path_inversion", false),
+        rclcpp::Parameter("test_rpp.inversion_xy_tolerance", 0.2),
+        rclcpp::Parameter("test_rpp.inversion_yaw_tolerance", 0.4)})
+    {
+      if (!node_->has_parameter(parameter.get_name())) {
+        node_->declare_parameter(parameter.get_name(), parameter.get_parameter_value());
+      }
+    }
+  }
+
+  void enforceInversions()
+  {
+    update({rclcpp::Parameter("test_rpp.allow_reversing", true),
+      rclcpp::Parameter("test_rpp.enforce_path_inversion", true)});
+  }
+
+  geometry_msgs::msg::PoseStamped robotPose(double x = 0.0, double y = 0.0, double yaw = 0.0)
+  {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header.frame_id = costmap_->getGlobalFrameID();
+    pose.header.stamp = node_->now();
+    pose.pose.position.x = x;
+    pose.pose.position.y = y;
+    pose.pose.orientation.z = std::sin(yaw / 2.0);
+    pose.pose.orientation.w = std::cos(yaw / 2.0);
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.frame_id = costmap_->getGlobalFrameID();
+    transform.child_frame_id = costmap_->getBaseFrameID();
+    transform.transform.translation.x = x;
+    transform.transform.translation.y = y;
+    transform.transform.rotation = pose.pose.orientation;
+    EXPECT_TRUE(tf_->setTransform(transform, "path_inversion_test", true));
+    return pose;
+  }
+
+  nav_msgs::msg::Path pathThrough(std::initializer_list<std::pair<double, double>> points)
+  {
+    nav_msgs::msg::Path path;
+    path.header.frame_id = costmap_->getGlobalFrameID();
+    path.header.stamp = node_->now();
+    for (const auto & point : points) {
+      geometry_msgs::msg::PoseStamped pose;
+      pose.header = path.header;
+      pose.pose.position.x = point.first;
+      pose.pose.position.y = point.second;
+      pose.pose.orientation.w = 1.0;
+      path.poses.push_back(pose);
+    }
+    return path;
+  }
+};
+
+TEST_F(PathInversionTest, normal_yaml_flags_preserve_golden_commands)
+{
+  ctrl_->deactivate();
+  ctrl_->cleanup();
+  // RPP settings from common/planner/pure_pursuit.yaml; wrapper-only settings are unrelated.
+  update({rclcpp::Parameter("test_rpp.lookahead_dist", 1.0),
+    rclcpp::Parameter("test_rpp.min_lookahead_dist", 0.3),
+    rclcpp::Parameter("test_rpp.max_lookahead_dist", 1.5),
+    rclcpp::Parameter("test_rpp.lookahead_time", 1.5),
+    rclcpp::Parameter("test_rpp.use_velocity_scaled_lookahead_dist", true),
+    rclcpp::Parameter("test_rpp.use_interpolation", true),
+    rclcpp::Parameter("test_rpp.use_rotate_to_heading", false),
+    rclcpp::Parameter("test_rpp.allow_reversing", false),
+    rclcpp::Parameter("test_rpp.use_collision_detection", true),
+    rclcpp::Parameter("test_rpp.use_regulated_linear_velocity_scaling", true),
+    rclcpp::Parameter("test_rpp.use_cost_regulated_linear_velocity_scaling", true),
+    rclcpp::Parameter("test_rpp.cost_scaling_dist", 0.6),
+    rclcpp::Parameter("test_rpp.inflation_cost_scaling_factor", 3.0),
+    rclcpp::Parameter("test_rpp.regulated_linear_scaling_min_radius", 0.9),
+    rclcpp::Parameter("test_rpp.max_angular_vel", 0.436332)});
+  ctrl_->configure(node_, "test_rpp", tf_, costmap_);
+  ctrl_->activate();
+  EXPECT_FALSE(node_->get_parameter("test_rpp.enforce_path_inversion").as_bool());
+
+  const auto straight = pathThrough({{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}});
+  const auto corner = pathThrough({{0.0, 0.0}, {0.5, 0.5}, {1.5, 1.5}});
+  const auto overlapping = pathThrough(
+    {{0.0, 0.0}, {0.0, 0.0}, {0.5, 0.5}, {1.5, 1.5}, {0.001, 0.002}});
+  std::vector<nav_msgs::msg::Path> paths{straight, corner, overlapping, overlapping};
+  const double corner_speed = 0.436332 * 0.3 / std::sqrt(2.0);
+  const std::vector<double> expected_linear{1.0, corner_speed, corner_speed, 0.05};
+  const std::vector<double> expected_angular{0.0, 0.436332, 0.436332, 0.0};
+  for (size_t i = 0; i < paths.size(); ++i) {
+    auto pose = i == 3 ? robotPose(0.001, 0.001) : robotPose();
+    const auto implicit_off = ctrl_->evaluateVelocityCommands(
+      paths[i], 1.0, pose, geometry_msgs::msg::Twist(), &goal_checker_);
+    update({rclcpp::Parameter("test_rpp.enforce_path_inversion", false)});
+    const auto explicit_off = ctrl_->evaluateVelocityCommands(
+      paths[i], 1.0, pose, geometry_msgs::msg::Twist(), &goal_checker_);
+    EXPECT_EQ(implicit_off.command, explicit_off.command);
+    EXPECT_EQ(implicit_off.transformed_plan, explicit_off.transformed_plan);
+    EXPECT_NEAR(implicit_off.command.twist.linear.x, expected_linear[i], 1e-12);
+    EXPECT_NEAR(implicit_off.command.twist.angular.z, expected_angular[i], 1e-12);
+    ctrl_->setPlan(paths[i]);
+    EXPECT_EQ(ctrl_->computeVelocityCommands(
+        pose, geometry_msgs::msg::Twist(), &goal_checker_), implicit_off.command);
+  }
+}
+
+TEST_F(PathInversionTest, closer_future_reverse_segment_is_excluded)
+{
+  enforceInversions();
+  const auto path = pathThrough({{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}, {1.0, 0.1}, {0.2, 0.1}});
+  const auto pose = robotPose(0.2, 0.1);
+  const auto result = ctrl_->evaluateVelocityCommands(
+    path, 1.0, pose, geometry_msgs::msg::Twist(), &goal_checker_);
+  ASSERT_EQ(result.transformed_plan.poses.size(), 3u);
+  EXPECT_NEAR(result.transformed_plan.poses.front().pose.position.x, -0.2, 1e-12);
+  EXPECT_NEAR(result.transformed_plan.poses.back().pose.position.x, 1.8, 1e-12);
+  EXPECT_GT(result.command.twist.linear.x, 0.0);
+}
+
+TEST_F(PathInversionTest, inversion_requires_both_tolerances_and_set_plan_resets_progress)
+{
+  enforceInversions();
+  const auto path = pathThrough({{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}});
+  ctrl_->setPlan(path);
+  auto pose = robotPose(1.7);
+  EXPECT_GT(ctrl_->computeVelocityCommands(
+      pose, geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+  pose = robotPose(1.9, 0.0, 0.5);
+  EXPECT_GT(ctrl_->computeVelocityCommands(
+      pose, geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+  pose = robotPose(1.9);
+  EXPECT_LT(ctrl_->computeVelocityCommands(
+      pose, geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+  // Moving beyond the tolerance does not re-enter the completed forward segment.
+  pose = robotPose(0.8);
+  EXPECT_LT(ctrl_->computeVelocityCommands(
+      pose, geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+  ctrl_->setPlan(path);
+  EXPECT_GT(ctrl_->computeVelocityCommands(
+      pose, geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+}
+
+TEST_F(PathInversionTest, enforcement_requires_reversing_during_configuration)
+{
+  for (bool rotate : {false, true}) {
+    auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("invalid_inversion_mode");
+    node->declare_parameter("test_rpp.enforce_path_inversion", true);
+    node->declare_parameter("test_rpp.use_rotate_to_heading", rotate);
+    // The true/true case must be rejected after configure's existing reversal resolution.
+    node->declare_parameter("test_rpp.allow_reversing", rotate);
+    BasicAPIRPP controller;
+    EXPECT_THROW(controller.configure(node, "test_rpp", tf_, costmap_), std::invalid_argument);
+  }
+}
+
+TEST_F(PathInversionTest, enforcement_flag_batches_validate_before_mutating_state)
+{
+  const auto rejected_enable = node_->set_parameters_atomically(
+    {rclcpp::Parameter("test_rpp.enforce_path_inversion", true)});
+  EXPECT_FALSE(rejected_enable.successful);
+  EXPECT_FALSE(node_->get_parameter("test_rpp.enforce_path_inversion").as_bool());
+  for (bool reverse_order : {false, true}) {
+    std::vector<rclcpp::Parameter> enable{
+      rclcpp::Parameter("test_rpp.allow_reversing", true),
+      rclcpp::Parameter("test_rpp.enforce_path_inversion", true)};
+    if (reverse_order) {
+      std::reverse(enable.begin(), enable.end());
+    }
+    update(enable);
+    const auto rejected_disable = node_->set_parameters_atomically(
+      {rclcpp::Parameter("test_rpp.desired_linear_vel", 0.125),
+        rclcpp::Parameter("test_rpp.allow_reversing", false)});
+    EXPECT_FALSE(rejected_disable.successful);
+    EXPECT_TRUE(node_->get_parameter("test_rpp.enforce_path_inversion").as_bool());
+    EXPECT_TRUE(node_->get_parameter("test_rpp.allow_reversing").as_bool());
+    EXPECT_DOUBLE_EQ(ctrl_->getSpeed(), 1.0);
+    const auto rejected_rotation = node_->set_parameters_atomically(
+      {rclcpp::Parameter("test_rpp.use_rotate_to_heading", true)});
+    EXPECT_FALSE(rejected_rotation.successful);
+    EXPECT_FALSE(node_->get_parameter("test_rpp.use_rotate_to_heading").as_bool());
+    std::vector<rclcpp::Parameter> disable{
+      rclcpp::Parameter("test_rpp.allow_reversing", false),
+      rclcpp::Parameter("test_rpp.enforce_path_inversion", false)};
+    if (reverse_order) {
+      std::reverse(disable.begin(), disable.end());
+    }
+    update(disable);
+  }
+}
+
+TEST_F(PathInversionTest, unsteerable_cusp_heading_fails_without_advancing_progress)
+{
+  enforceInversions();
+  const auto path = pathThrough({{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}});
+  for (double x : {2.0, 1.99, 2.01}) {
+    ctrl_->setPlan(path);
+    auto pose = robotPose(x, 0.0, 0.5);
+    EXPECT_THROW(ctrl_->computeVelocityCommands(
+        pose, geometry_msgs::msg::Twist(), &goal_checker_), nav2_core::PlannerException);
+    EXPECT_THROW(ctrl_->evaluateVelocityCommands(
+        path, 1.0, pose, geometry_msgs::msg::Twist(), &goal_checker_), nav2_core::PlannerException);
+    // Failed adopted evaluations must not release the reverse segment.
+    pose = robotPose(0.8);
+    EXPECT_GT(ctrl_->computeVelocityCommands(
+        pose, geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+    // Once heading is corrected at the cusp, the same plan can proceed in reverse.
+    pose = robotPose(x);
+    EXPECT_LT(ctrl_->computeVelocityCommands(
+        pose, geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+  }
+}
+
+TEST_F(PathInversionTest, adopted_progress_crosses_multiple_inversions_in_order)
+{
+  enforceInversions();
+  const auto path = pathThrough(
+    {{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}, {1.0, 0.0}});
+  ctrl_->setPlan(path);
+  EXPECT_LT(ctrl_->computeVelocityCommands(
+      robotPose(1.9), geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+  EXPECT_GT(ctrl_->computeVelocityCommands(
+      robotPose(0.1), geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+  EXPECT_GT(ctrl_->computeVelocityCommands(
+      robotPose(0.5), geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+}
+
+TEST_F(PathInversionTest, heading_guard_checks_the_next_pending_cusp)
+{
+  enforceInversions();
+  auto path = pathThrough({{0.0, 0.0}, {1.0, 0.0}, {1.02, 0.0}, {1.0, 0.0}, {1.5, 0.0}});
+  path.poses[3].pose.orientation.z = std::sin(0.25);
+  path.poses[3].pose.orientation.w = std::cos(0.25);
+  ctrl_->setPlan(path);
+  EXPECT_THROW(ctrl_->computeVelocityCommands(
+      robotPose(1.02), geometry_msgs::msg::Twist(), &goal_checker_), nav2_core::PlannerException);
+}
+
+TEST_F(PathInversionTest, duplicate_positions_do_not_hide_a_reversal)
+{
+  enforceInversions();
+  const auto path = pathThrough(
+    {{0.0, 0.0}, {1.0, 0.0}, {1.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}, {-0.5, 0.0}});
+  const auto result = ctrl_->evaluateVelocityCommands(
+    path, 1.0, robotPose(), geometry_msgs::msg::Twist(), &goal_checker_);
+  ASSERT_EQ(result.transformed_plan.poses.size(), 4u);
+  EXPECT_DOUBLE_EQ(result.transformed_plan.poses.back().pose.position.x, 1.0);
+  EXPECT_GT(result.command.twist.linear.x, 0.0);
+}
+
+TEST_F(PathInversionTest, rotation_tie_handling_is_confined_to_reversing_paths)
+{
+  auto path = pathThrough({{0.0, 0.0}, {1.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+  for (size_t i : {2u, 3u}) {
+    path.poses[i].pose.orientation.z = std::sin(M_PI / 4.0);
+    path.poses[i].pose.orientation.w = std::cos(M_PI / 4.0);
+  }
+  const auto pose = robotPose(1.0, 0.0, M_PI / 2.0);
+  update({rclcpp::Parameter("test_rpp.allow_reversing", true)});
+  const auto reversing = ctrl_->evaluateVelocityCommands(
+    path, 1.0, pose, geometry_msgs::msg::Twist(), &goal_checker_);
+  ASSERT_EQ(reversing.transformed_plan.poses.size(), 2u);
+  EXPECT_NEAR(tf2::getYaw(reversing.transformed_plan.poses.front().pose.orientation), 0.0, 1e-12);
+  update({rclcpp::Parameter("test_rpp.allow_reversing", false)});
+  const auto normal = ctrl_->evaluateVelocityCommands(
+    path, 1.0, pose, geometry_msgs::msg::Twist(), &goal_checker_);
+  ASSERT_EQ(normal.transformed_plan.poses.size(), 3u);
+  EXPECT_NEAR(tf2::getYaw(normal.transformed_plan.poses.front().pose.orientation), -M_PI / 2.0, 1e-12);
+}
+
+TEST_F(PathInversionTest, candidates_and_failures_leave_adopted_progress_unchanged)
+{
+  enforceInversions();
+  const auto adopted = pathThrough(
+    {{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}});
+  ctrl_->setPlan(adopted);
+  auto pose = robotPose(1.9);
+  ASSERT_LT(ctrl_->computeVelocityCommands(
+      pose, geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+  const auto candidate = pathThrough(
+    {{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}, {1.0, 0.1}, {0.2, 0.1}});
+  pose = robotPose(0.2, 0.1);
+  const auto first = ctrl_->evaluateVelocityCommands(
+    candidate, 0.3, pose, geometry_msgs::msg::Twist(), &goal_checker_);
+  ASSERT_EQ(first.transformed_plan.poses.size(), 3u);
+  ctrl_->evaluateVelocityCommands(
+    adopted, 0.1, robotPose(1.9), geometry_msgs::msg::Twist(), &goal_checker_);
+  EXPECT_THROW(ctrl_->evaluateVelocityCommands(
+      nav_msgs::msg::Path(), 0.3, pose, geometry_msgs::msg::Twist(), &goal_checker_),
+    nav2_core::PlannerException);
+  EXPECT_THROW(ctrl_->evaluateVelocityCommands(
+      candidate, -1.0, pose, geometry_msgs::msg::Twist(), &goal_checker_),
+    nav2_core::PlannerException);
+  EXPECT_THROW(ctrl_->evaluateVelocityCommands(
+      adopted, 0.3, robotPose(2.0, 0.0, 0.5), geometry_msgs::msg::Twist(), &goal_checker_),
+    nav2_core::PlannerException);
+  pose = robotPose(0.2, 0.1);
+  const auto second = ctrl_->evaluateVelocityCommands(
+    candidate, 0.3, pose, geometry_msgs::msg::Twist(), &goal_checker_);
+  // Header timestamps can differ, so compare the actual command and path geometry.
+  EXPECT_EQ(first.command.twist, second.command.twist);
+  ASSERT_EQ(first.transformed_plan.poses.size(), second.transformed_plan.poses.size());
+  for (size_t i = 0; i < first.transformed_plan.poses.size(); ++i) {
+    EXPECT_EQ(first.transformed_plan.poses[i].pose, second.transformed_plan.poses[i].pose);
+  }
+  EXPECT_EQ(ctrl_->getPlan(), adopted);
+  EXPECT_DOUBLE_EQ(ctrl_->getSpeed(), 1.0);
+  pose = robotPose(0.8);
+  EXPECT_LT(ctrl_->computeVelocityCommands(
+      pose, geometry_msgs::msg::Twist(), &goal_checker_).twist.linear.x, 0.0);
+}
 
 TEST_F(CandidateEvaluationTest, candidates_preserve_state_and_match_regular_commands)
 {

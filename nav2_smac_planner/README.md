@@ -21,9 +21,13 @@ See its [Configuration Guide Page](https://navigation.ros.org/configuration/pack
 
 ## Local source baseline
 
-This package is synchronized with [Nav2 Humble `3c3db59d`](https://github.com/ros-navigation/navigation2/tree/3c3db59d6969d8ecee8e68468693d006397f4a0c/nav2_smac_planner) (version 1.1.20). Its implementation, interfaces, tests, and motion primitive data match that source; this provenance note is the only local addition.
+This package is based on [Nav2 Humble `3c3db59d`](https://github.com/ros-navigation/navigation2/tree/3c3db59d6969d8ecee8e68468693d006397f4a0c/nav2_smac_planner) (version 1.1.20), with selected fixes from [Nav2 main `3b7ec435`](https://github.com/ros-navigation/navigation2/tree/3b7ec4355be91ab32da850e9a77382300c1ca560/nav2_smac_planner).
 
-Main-branch fixes are outside this baseline. In particular, the non-circular footprint smoother update in [PR #6257](https://github.com/ros-navigation/navigation2/pull/6257) is not included. Lattice start/goal map bounds and exact requested goal-pose collision checks also require separate review before use with a rolling local Costmap.
+The smoother checks non-circular footprints as in [PR #6257](https://github.com/ros-navigation/navigation2/pull/6257). Lattice and Hybrid pass the current footprint; circular robots and the 2D planner retain center-cell checking. Humble's direction/orientation helpers and refinement settings are retained. A rejected smoothing update rolls back to the preceding path; the planner may still return that path. Footprint checks can change smoothing results and processing time near obstacles.
+
+Lattice rejects start or goal positions outside the current Costmap before searching. This uses Humble's integer `worldToMap()` and `PlannerException`; continuous coordinates and newer exception types are not introduced.
+
+The smoother's subsequent start/end boundary expansion still checks center cells, so [issue #6597](https://github.com/ros-navigation/navigation2/issues/6597) remains outside these changes. Exact requested goal-pose collision checking from the unmerged [PR #6633](https://github.com/ros-navigation/navigation2/pull/6633) and the multi-instance static-state changes are also not included. This package is not yet selected as PlannerMgmt's recovery strategy.
 
 ## Introduction
 

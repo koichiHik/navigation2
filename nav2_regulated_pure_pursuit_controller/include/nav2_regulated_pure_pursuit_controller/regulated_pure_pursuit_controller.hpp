@@ -137,6 +137,12 @@ public:
   void setSpeedLimit(const double & speed_limit, const bool & percentage) override;
 
 protected:
+  struct PathProgress
+  {
+    size_t segment_start{0};
+    size_t closest_pose{0};
+  };
+
   /**
    * @brief Transforms global plan into same frame as pose and clips poses ineligible for lookaheadPoint
    * Points ineligible to be selected as a lookahead point if they are any of the following:
@@ -275,7 +281,12 @@ protected:
   double goalDistanceTolerance(nav2_core::GoalChecker * goal_checker);
 
   nav_msgs::msg::Path transformPlan(
-    nav_msgs::msg::Path & plan, const geometry_msgs::msg::PoseStamped & pose);
+    nav_msgs::msg::Path & plan, const geometry_msgs::msg::PoseStamped & pose,
+    PathProgress * progress = nullptr);
+
+  nav_msgs::msg::Path transformInversionPlan(
+    const nav_msgs::msg::Path & plan, const geometry_msgs::msg::PoseStamped & pose,
+    PathProgress & progress);
 
   /**
    * @brief Find the intersection a circle and a line segment.
@@ -353,10 +364,14 @@ protected:
   double rotate_to_heading_min_angle_;
   double goal_dist_tol_;
   bool allow_reversing_;
+  bool enforce_path_inversion_{false};
+  double inversion_xy_tolerance_{0.2};
+  double inversion_yaw_tolerance_{0.4};
   double max_robot_pose_search_dist_;
   bool use_interpolation_;
 
   nav_msgs::msg::Path global_plan_;
+  PathProgress path_progress_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>> global_path_pub_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PointStamped>>
   carrot_pub_;

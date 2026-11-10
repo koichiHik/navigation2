@@ -23,6 +23,7 @@
 #include <utility>
 
 #include "nav2_costmap_2d/costmap_2d.hpp"
+#include "nav2_costmap_2d/footprint_collision_checker.hpp"
 #include "nav2_smac_planner/types.hpp"
 #include "nav2_smac_planner/constants.hpp"
 #include "nav2_util/geometry_utils.hpp"
@@ -110,12 +111,14 @@ public:
    * @param path Reference to path
    * @param costmap Pointer to minimal costmap
    * @param max_time Maximum time to compute, stop early if over limit
+   * @param footprint Non-circular robot footprint; empty keeps center-cell checking
    * @return If smoothing was successful
    */
   bool smooth(
     nav_msgs::msg::Path & path,
     const nav2_costmap_2d::Costmap2D * costmap,
-    const double & max_time);
+    const double & max_time,
+    const std::vector<geometry_msgs::msg::Point> & footprint = {});
 
 protected:
   /**
@@ -124,13 +127,15 @@ protected:
    * @param reversing_segment Return if this is a reversing segment
    * @param costmap Pointer to minimal costmap
    * @param max_time Maximum time to compute, stop early if over limit
+   * @param footprint Non-circular robot footprint; empty keeps center-cell checking
    * @return If smoothing was successful
    */
   bool smoothImpl(
     nav_msgs::msg::Path & path,
     bool & reversing_segment,
     const nav2_costmap_2d::Costmap2D * costmap,
-    const double & max_time);
+    const double & max_time,
+    const std::vector<geometry_msgs::msg::Point> & footprint);
 
   /**
    * @brief Get the field value for a given dimension
@@ -236,6 +241,7 @@ protected:
   bool is_holonomic_, do_refinement_;
   MotionModel motion_model_;
   ompl::base::StateSpacePtr state_space_;
+  nav2_costmap_2d::FootprintCollisionChecker<nav2_costmap_2d::Costmap2D *> footprint_checker_;
 };
 
 }  // namespace nav2_smac_planner

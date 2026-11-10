@@ -13,11 +13,13 @@
 // limitations under the License.
 
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 #include "gtest/gtest.h"
 #include "rclcpp/rclcpp.hpp"
 #include "nav2_mppi_controller/optimizer.hpp"
+#include "nav2_costmap_2d/costmap_filters/filter_values.hpp"
 
 // Tests main optimizer functions
 
@@ -147,6 +149,11 @@ public:
   {
     auto & s = settings_;
     return {s.constraints.vx_min, s.constraints.vx_max};
+  }
+
+  const models::ControlConstraints & getConstraints() const
+  {
+    return settings_.constraints;
   }
 
   void applyControlSequenceConstraintsWrapper()
@@ -341,8 +348,123 @@ TEST(OptimizerTests, FallbackTests)
   // for hard reset
   EXPECT_FALSE(optimizer_tester.fallbackWrapper(false));
   EXPECT_TRUE(optimizer_tester.fallbackWrapper(true));
+  // Success in a different controller must not reset this controller's retries.
+  OptimizerTester other_optimizer;
+  EXPECT_FALSE(other_optimizer.fallbackWrapper(false));
   EXPECT_TRUE(optimizer_tester.fallbackWrapper(true));
   EXPECT_THROW(optimizer_tester.fallbackWrapper(true), std::runtime_error);
+}
+
+class OptimizerSpeedLimitTest : public ::testing::Test
+{
+protected:
+  void initialize(double vx_max = 0.5, double vx_min = -0.35)
+  {
+    node_ = std::make_shared<rclcpp_lifecycle::LifecycleNode>("speed_limit_test");
+    node_->declare_parameter("controller_frequency", 20.0);
+    node_->declare_parameter("mppic.batch_size", 8);
+    node_->declare_parameter("mppic.time_steps", 12);
+    node_->declare_parameter("mppic.vx_max", vx_max);
+    node_->declare_parameter("mppic.vx_min", vx_min);
+    costmap_ = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
+      "speed_limit_costmap", "", "speed_limit_costmap");
+    costmap_->on_configure(rclcpp_lifecycle::State{});
+    handler_ = std::make_unique<ParametersHandler>(node_);
+    optimizer_.initialize(node_, "mppic", costmap_, handler_.get());
+  }
+
+  rclcpp_lifecycle::LifecycleNode::SharedPtr node_;
+  std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_;
+  std::unique_ptr<ParametersHandler> handler_;
+  OptimizerTester optimizer_;
+};
+
+TEST_F(OptimizerSpeedLimitTest, FallbackPreservesLimitAndExplicitResetRestoresBase)
+{
+  initialize();
+  optimizer_.setSpeedLimit(50.0, true);
+  const auto limited = optimizer_.getConstraints();
+  ASSERT_TRUE(optimizer_.fallbackWrapper(true));
+  const auto & retained = optimizer_.getConstraints();
+  EXPECT_FLOAT_EQ(retained.vx_max, limited.vx_max);
+  EXPECT_FLOAT_EQ(retained.vx_min, limited.vx_min);
+  EXPECT_FLOAT_EQ(retained.vy, limited.vy);
+  EXPECT_FLOAT_EQ(retained.wz, limited.wz);
+  EXPECT_FALSE(optimizer_.fallbackWrapper(false));
+
+  // The existing no-argument API remains an explicit return to base constraints.
+  optimizer_.reset();
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vx_max, 0.5f);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vx_min, -0.35f);
+}
+
+TEST_F(OptimizerSpeedLimitTest, UnrelatedParameterPreservesLimitAndWarmStart)
+{
+  initialize();
+  node_->declare_parameter("goal_checker.trans_stopped_velocity", 0.01);
+  handler_->start();
+  optimizer_.setSpeedLimit(50.0, true);
+  optimizer_.grabControlSequence().vx.fill(0.1f);
+
+  auto result = node_->set_parameter(
+    rclcpp::Parameter("goal_checker.trans_stopped_velocity", 0.02));
+  ASSERT_TRUE(result.successful);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vx_max, 0.25f);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vx_min, -0.175f);
+  EXPECT_FLOAT_EQ(optimizer_.grabControlSequence().vx(0), 0.1f);
+}
+
+TEST_F(OptimizerSpeedLimitTest, OwnDynamicParameterStillRestoresBase)
+{
+  initialize();
+  handler_->start();
+  optimizer_.setSpeedLimit(50.0, true);
+  optimizer_.grabControlSequence().vx.fill(0.1f);
+
+  auto result = node_->set_parameter(rclcpp::Parameter("mppic.temperature", 0.4));
+  ASSERT_TRUE(result.successful);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vx_max, 0.5f);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vx_min, -0.35f);
+  EXPECT_FLOAT_EQ(optimizer_.grabControlSequence().vx(0), 0.0f);
+}
+
+TEST_F(OptimizerSpeedLimitTest, ReverseOnlyAbsoluteLimitRemainsFinite)
+{
+  initialize(0.0, -0.3);
+  const auto base = optimizer_.getConstraints();
+  optimizer_.setSpeedLimit(0.2, false);
+  const auto & limited = optimizer_.getConstraints();
+  EXPECT_TRUE(std::isfinite(limited.vx_max));
+  EXPECT_TRUE(std::isfinite(limited.vx_min));
+  EXPECT_TRUE(std::isfinite(limited.vy));
+  EXPECT_TRUE(std::isfinite(limited.wz));
+  EXPECT_FLOAT_EQ(limited.vx_max, 0.0f);
+  EXPECT_NEAR(limited.vx_min, -0.2f, 1e-6);
+  EXPECT_NEAR(limited.vy, base.vy * 2.0 / 3.0, 1e-6);
+  EXPECT_NEAR(limited.wz, base.wz * 2.0 / 3.0, 1e-6);
+
+  optimizer_.setSpeedLimit(nav2_costmap_2d::NO_SPEED_LIMIT, false);
+  EXPECT_FLOAT_EQ(limited.vx_min, base.vx_min);
+  EXPECT_FLOAT_EQ(limited.wz, base.wz);
+}
+
+TEST_F(OptimizerSpeedLimitTest, ZeroLinearReferenceKeepsExistingLimit)
+{
+  initialize(0.0, 0.0);
+  const auto base = optimizer_.getConstraints();
+  optimizer_.setSpeedLimit(0.2, false);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vx_max, base.vx_max);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vx_min, base.vx_min);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vy, base.vy);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().wz, base.wz);
+
+  optimizer_.setSpeedLimit(50.0, true);
+  const auto limited = optimizer_.getConstraints();
+  optimizer_.setSpeedLimit(0.2, false);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vx_max, limited.vx_max);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vx_min, limited.vx_min);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().vy, limited.vy);
+  EXPECT_FLOAT_EQ(optimizer_.getConstraints().wz, limited.wz);
 }
 
 TEST(OptimizerTests, PrepareTests)
