@@ -19,6 +19,12 @@ We have users reporting using this on:
 
 See its [Configuration Guide Page](https://navigation.ros.org/configuration/packages/configuring-smac-planner.html) for additional parameter descriptions.
 
+## Local source baseline
+
+This package is synchronized with [Nav2 Humble `3c3db59d`](https://github.com/ros-navigation/navigation2/tree/3c3db59d6969d8ecee8e68468693d006397f4a0c/nav2_smac_planner) (version 1.1.20). Its implementation, interfaces, tests, and motion primitive data match that source; this provenance note is the only local addition.
+
+Main-branch fixes are outside this baseline. In particular, the non-circular footprint smoother update in [PR #6257](https://github.com/ros-navigation/navigation2/pull/6257) is not included. Lattice start/goal map bounds and exact requested goal-pose collision checks also require separate review before use with a rolling local Costmap.
+
 ## Introduction
 
 The `nav2_smac_planner` package contains an optimized templated A* search algorithm used to create multiple A\*-based planners for multiple types of robot platforms. It was built by [Steve Macenski](https://www.linkedin.com/in/steve-macenski-41a985101/) while at [Samsung Research](https://www.sra.samsung.com/). We support **circular** differential-drive and omni-directional drive robots using the `SmacPlanner2D` planner which implements a cost-aware A\* planner. We support **legged, cars, car-like, and ackermann vehicles** using the `SmacPlannerHybrid` plugin which implements a Hybrid-A\* planner.  We support **non-circular, arbitrary shaped, any model vehicles** using the `SmacPlannerLattice` plugin which implements a State Lattice planner. It contains control sets and generators for ackermann, legged, differential drive and omnidirectional vehicles, but you may provide your own for another robot type or to have different planning behaviors. The last two plugins are also useful for curvature constrained or kinematically feasible planning, like when planning robot at high speeds to make sure they don't flip over or otherwise skid out of control. It is also applicable to non-round robots (such as large rectangular or arbitrary shaped robots of differential/omnidirectional drivetrains) that need pose-based collision checking.
@@ -131,7 +137,7 @@ planner_server:
         max_iterations: 1000
         w_smooth: 0.3
         w_data: 0.2
-        tolerance: 1e-10
+        tolerance: 1.0e-10
         do_refinement: true               # Whether to recursively run the smoother 3 times on the results from prior runs to refine the results further
 ```
 

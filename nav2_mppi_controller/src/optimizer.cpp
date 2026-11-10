@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cmath>
 #include <xtensor/xmath.hpp>
 #include <xtensor/xrandom.hpp>
 #include <xtensor/xnoalias.hpp>
@@ -48,7 +49,7 @@ void Optimizer::initialize(
   getParams();
 
   critic_manager_.on_configure(parent_, name_, costmap_ros_, parameters_handler_);
-  noise_generator_.initialize(settings_, isHolonomic());
+  noise_generator_.initialize(settings_, isHolonomic(), name_, parameters_handler_);
 
   reset();
 }
@@ -120,6 +121,8 @@ void Optimizer::reset()
   control_history_[1] = {0.0, 0.0, 0.0};
   control_history_[2] = {0.0, 0.0, 0.0};
   control_history_[3] = {0.0, 0.0, 0.0};
+
+  settings_.constraints = settings_.base_constraints;
 
   costs_ = xt::zeros<float>({settings_.batch_size});
   generated_trajectories_.reset(settings_.batch_size, settings_.time_steps);
@@ -267,7 +270,7 @@ void Optimizer::integrateStateVelocities(
   xt::xtensor<float, 2> & trajectory,
   const xt::xtensor<float, 2> & sequence) const
 {
-  double initial_yaw = tf2::getYaw(state_.pose.pose.orientation);
+  float initial_yaw = tf2::getYaw(state_.pose.pose.orientation);
 
   const auto vx = xt::view(sequence, xt::all(), 0);
   const auto vy = xt::view(sequence, xt::all(), 2);
@@ -277,16 +280,15 @@ void Optimizer::integrateStateVelocities(
   auto traj_y = xt::view(trajectory, xt::all(), 1);
   auto traj_yaws = xt::view(trajectory, xt::all(), 2);
 
-  xt::noalias(traj_yaws) =
-    utils::normalize_angles(xt::cumsum(wz * settings_.model_dt, 0) + initial_yaw);
+  xt::noalias(traj_yaws) = cumsum_1d(wz * settings_.model_dt) + initial_yaw;
 
   auto && yaw_cos = xt::xtensor<float, 1>::from_shape(traj_yaws.shape());
   auto && yaw_sin = xt::xtensor<float, 1>::from_shape(traj_yaws.shape());
 
   const auto yaw_offseted = xt::view(traj_yaws, xt::range(1, _));
 
-  xt::noalias(xt::view(yaw_cos, 0)) = std::cos(initial_yaw);
-  xt::noalias(xt::view(yaw_sin, 0)) = std::sin(initial_yaw);
+  xt::noalias(xt::view(yaw_cos, 0)) = cosf(initial_yaw);
+  xt::noalias(xt::view(yaw_sin, 0)) = sinf(initial_yaw);
   xt::noalias(xt::view(yaw_cos, xt::range(1, _))) = xt::cos(yaw_offseted);
   xt::noalias(xt::view(yaw_sin, xt::range(1, _))) = xt::sin(yaw_offseted);
 
@@ -298,25 +300,25 @@ void Optimizer::integrateStateVelocities(
     dy = dy + vy * yaw_cos;
   }
 
-  xt::noalias(traj_x) = state_.pose.pose.position.x + xt::cumsum(dx * settings_.model_dt, 0);
-  xt::noalias(traj_y) = state_.pose.pose.position.y + xt::cumsum(dy * settings_.model_dt, 0);
+  xt::noalias(traj_x) = state_.pose.pose.position.x + cumsum_1d(dx * settings_.model_dt);
+  xt::noalias(traj_y) = state_.pose.pose.position.y + cumsum_1d(dy * settings_.model_dt);
 }
 
 void Optimizer::integrateStateVelocities(
   models::Trajectories & trajectories,
   const models::State & state) const
 {
-  const double initial_yaw = tf2::getYaw(state.pose.pose.orientation);
+  const float initial_yaw = tf2::getYaw(state.pose.pose.orientation);
 
   xt::noalias(trajectories.yaws) =
-    utils::normalize_angles(xt::cumsum(state.wz * settings_.model_dt, 1) + initial_yaw);
+    cumsum_2d(state.wz * settings_.model_dt, 1) + initial_yaw;
 
   const auto yaws_cutted = xt::view(trajectories.yaws, xt::all(), xt::range(0, -1));
 
   auto && yaw_cos = xt::xtensor<float, 2>::from_shape(trajectories.yaws.shape());
   auto && yaw_sin = xt::xtensor<float, 2>::from_shape(trajectories.yaws.shape());
-  xt::noalias(xt::view(yaw_cos, xt::all(), 0)) = std::cos(initial_yaw);
-  xt::noalias(xt::view(yaw_sin, xt::all(), 0)) = std::sin(initial_yaw);
+  xt::noalias(xt::view(yaw_cos, xt::all(), 0)) = cosf(initial_yaw);
+  xt::noalias(xt::view(yaw_sin, xt::all(), 0)) = sinf(initial_yaw);
   xt::noalias(xt::view(yaw_cos, xt::all(), xt::range(1, _))) = xt::cos(yaws_cutted);
   xt::noalias(xt::view(yaw_sin, xt::all(), xt::range(1, _))) = xt::sin(yaws_cutted);
 
@@ -329,9 +331,9 @@ void Optimizer::integrateStateVelocities(
   }
 
   xt::noalias(trajectories.x) = state.pose.pose.position.x +
-    xt::cumsum(dx * settings_.model_dt, 1);
+    cumsum_2d(dx * settings_.model_dt, 1);
   xt::noalias(trajectories.y) = state.pose.pose.position.y +
-    xt::cumsum(dy * settings_.model_dt, 1);
+    cumsum_2d(dy * settings_.model_dt, 1);
 }
 
 xt::xtensor<float, 2> Optimizer::getOptimizedTrajectory()
@@ -357,16 +359,16 @@ void Optimizer::updateControlSequence()
   auto bounded_noises_vx = state_.cvx - control_sequence_.vx;
   auto bounded_noises_wz = state_.cwz - control_sequence_.wz;
   xt::noalias(costs_) +=
-    s.gamma / std::pow(s.sampling_std.vx, 2) * xt::sum(
+    s.gamma / powf(s.sampling_std.vx, 2) * xt::sum(
     xt::view(control_sequence_.vx, xt::newaxis(), xt::all()) * bounded_noises_vx, 1, immediate);
   xt::noalias(costs_) +=
-    s.gamma / std::pow(s.sampling_std.wz, 2) * xt::sum(
+    s.gamma / powf(s.sampling_std.wz, 2) * xt::sum(
     xt::view(control_sequence_.wz, xt::newaxis(), xt::all()) * bounded_noises_wz, 1, immediate);
 
   if (isHolonomic()) {
     auto bounded_noises_vy = state_.cvy - control_sequence_.vy;
     xt::noalias(costs_) +=
-      s.gamma / std::pow(s.sampling_std.vy, 2) * xt::sum(
+      s.gamma / powf(s.sampling_std.vy, 2) * xt::sum(
       xt::view(control_sequence_.vy, xt::newaxis(), xt::all()) * bounded_noises_vy,
       1, immediate);
   }
@@ -377,8 +379,10 @@ void Optimizer::updateControlSequence()
   auto && softmaxes_extened = xt::eval(xt::view(softmaxes, xt::all(), xt::newaxis()));
 
   xt::noalias(control_sequence_.vx) = xt::sum(state_.cvx * softmaxes_extened, 0, immediate);
-  xt::noalias(control_sequence_.vy) = xt::sum(state_.cvy * softmaxes_extened, 0, immediate);
   xt::noalias(control_sequence_.wz) = xt::sum(state_.cwz * softmaxes_extened, 0, immediate);
+  if (isHolonomic()) {
+    xt::noalias(control_sequence_.vy) = xt::sum(state_.cvy * softmaxes_extened, 0, immediate);
+  }
 
   applyControlSequenceConstraints();
 }
@@ -406,7 +410,7 @@ void Optimizer::setMotionModel(const std::string & model)
   } else if (model == "Omni") {
     motion_model_ = std::make_shared<OmniMotionModel>();
   } else if (model == "Ackermann") {
-    motion_model_ = std::make_shared<AckermannMotionModel>(parameters_handler_);
+    motion_model_ = std::make_shared<AckermannMotionModel>(parameters_handler_, name_);
   } else {
     throw std::runtime_error(
             std::string(
