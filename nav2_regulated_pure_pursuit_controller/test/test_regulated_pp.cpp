@@ -18,6 +18,7 @@
 #include <vector>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 #include "gtest/gtest.h"
 #include "rclcpp/rclcpp.hpp"
@@ -454,13 +455,13 @@ TEST(RegulatedPurePursuitTest, rotateTests)
   // basic full speed at a speed
   ctrl->rotateToHeadingWrapper(lin_v, ang_v, angle_to_path, curr_speed);
   EXPECT_EQ(lin_v, 0.0);
-  EXPECT_EQ(ang_v, 1.8);
+  EXPECT_EQ(ang_v, 1.6);  // Slow down before overshooting the remaining angle.
 
   // negative direction
   angle_to_path = -0.4;
   curr_speed.angular.z = -1.75;
   ctrl->rotateToHeadingWrapper(lin_v, ang_v, angle_to_path, curr_speed);
-  EXPECT_EQ(ang_v, -1.8);
+  EXPECT_EQ(ang_v, -1.6);
 
   // kinematic clamping, no speed, some speed accelerating, some speed decelerating
   angle_to_path = 0.4;
@@ -1020,6 +1021,35 @@ public:
   double tolerance{0.1};
 };
 
+class CostmapLockGoalChecker : public AngularLimitGoalChecker
+{
+public:
+  explicit CostmapLockGoalChecker(nav2_costmap_2d::Costmap2D::mutex_t & mutex)
+  : mutex_(mutex) {}
+
+  bool getTolerances(
+    geometry_msgs::msg::Pose & pose_tolerance, geometry_msgs::msg::Twist & twist_tolerance) override
+  {
+    // A different thread must fail to acquire the map while the controller is
+    // evaluating it. Trying from this thread would always pass for a recursive mutex.
+    bool acquired = false;
+    std::thread observer([&]() {
+        acquired = mutex_.try_lock();
+        if (acquired) {
+          mutex_.unlock();
+        }
+      });
+    observer.join();
+    locked_during_evaluation.push_back(!acquired);
+    return AngularLimitGoalChecker::getTolerances(pose_tolerance, twist_tolerance);
+  }
+
+  std::vector<bool> locked_during_evaluation;
+
+private:
+  nav2_costmap_2d::Costmap2D::mutex_t & mutex_;
+};
+
 class AngularVelocityLimitTest : public ::testing::Test
 {
 protected:
@@ -1172,6 +1202,47 @@ TEST_F(AngularVelocityLimitTest, limits_rotation_even_when_measured_speed_exceed
   }
 }
 
+TEST_F(AngularVelocityLimitTest, applies_heading_braking_after_acceleration_clamping)
+{
+  update({rclcpp::Parameter("test_rpp.max_angular_accel", 2.0)});
+  for (double direction : {-1.0, 1.0}) {
+    SCOPED_TRACE(direction);
+    geometry_msgs::msg::Twist speed;
+    speed.angular.z = direction * 0.3;
+    double linear_vel = 1.0;
+    double angular_vel = 0.0;
+
+    // At 2 rad/s^2, 0.25 rad/s takes exactly 1/64 rad to stop. The
+    // acceleration-limited command alone would increase the speed to 0.4.
+    ctrl_->rotateToHeadingWrapper(
+      linear_vel, angular_vel, direction / 64.0, speed);
+    EXPECT_DOUBLE_EQ(linear_vel, 0.0);
+    EXPECT_DOUBLE_EQ(angular_vel, direction * 0.25);
+
+    // Starting from rest still respects the 0.05 s control period: the
+    // first command is 0.1 rad/s even when the stopping bound is higher.
+    speed.angular.z = 0.0;
+    ctrl_->rotateToHeadingWrapper(
+      linear_vel, angular_vel, direction / 64.0, speed);
+    EXPECT_DOUBLE_EQ(angular_vel, direction * 0.1);
+
+    // If already rotating away from the target, first decelerate in the
+    // current direction rather than reversing the angular command immediately.
+    speed.angular.z = -direction * 0.3;
+    ctrl_->rotateToHeadingWrapper(
+      linear_vel, angular_vel, direction / 64.0, speed);
+    EXPECT_NEAR(angular_vel, -direction * 0.2, 1e-12);
+  }
+
+  double linear_vel = 1.0;
+  double angular_vel = 0.0;
+  geometry_msgs::msg::Twist speed;
+  speed.angular.z = 0.3;
+  ctrl_->rotateToHeadingWrapper(linear_vel, angular_vel, 0.0, speed);
+  EXPECT_DOUBLE_EQ(linear_vel, 0.0);
+  EXPECT_DOUBLE_EQ(angular_vel, 0.0);
+}
+
 TEST_F(AngularVelocityLimitTest, collision_check_uses_limited_commands)
 {
   // The existing collision-detection switch is read during configuration only.
@@ -1297,6 +1368,76 @@ TEST_F(CandidateEvaluationTest, candidates_preserve_state_and_match_regular_comm
   EXPECT_EQ(regular, normal.command);
   EXPECT_DOUBLE_EQ(ctrl_->getGoalTolerance(), 0.02);
   EXPECT_EQ(ctrl_->getPlan().poses.size(), 3u);
+}
+
+TEST_F(CandidateEvaluationTest, rotation_braking_preserves_candidate_state_and_angular_limit)
+{
+  update(
+  {
+    rclcpp::Parameter("test_rpp.use_rotate_to_heading", true),
+    rclcpp::Parameter("test_rpp.max_angular_accel", 2.0)});
+  goal_checker_.tolerance = 0.05;
+
+  for (double direction : {-1.0, 1.0}) {
+    for (double angular_limit : {-1.0, 0.2}) {
+      SCOPED_TRACE(direction);
+      SCOPED_TRACE(angular_limit);
+      auto plan = candidatePlan(0.0);
+      plan.poses[2].pose.position.x = 0.01;
+      plan.poses[3].pose.position.x = 0.02;
+      plan.poses.back().pose.orientation.z = std::sin(direction / 128.0);
+      plan.poses.back().pose.orientation.w = std::cos(direction / 128.0);
+      const auto robot_pose = plan.poses[1];
+      geometry_msgs::msg::Twist speed;
+      speed.angular.z = direction * 0.3;
+      update({rclcpp::Parameter("test_rpp.max_angular_vel", angular_limit)});
+      ctrl_->setPlan(plan);
+      ctrl_->setSpeedLimit(0.7, false);
+      const double goal_tolerance = ctrl_->getGoalTolerance();
+
+      const auto candidate = ctrl_->evaluateVelocityCommands(
+        plan, 0.1, robot_pose, speed, &goal_checker_);
+      EXPECT_FALSE(candidate.collision_detected);
+      EXPECT_DOUBLE_EQ(candidate.command.twist.linear.x, 0.0);
+      EXPECT_NEAR(
+        candidate.command.twist.angular.z,
+        direction * (angular_limit < 0.0 ? 0.25 : 0.2), 1e-12);
+      EXPECT_EQ(ctrl_->getPlan(), plan);
+      EXPECT_DOUBLE_EQ(ctrl_->getSpeed(), 0.7);
+      EXPECT_DOUBLE_EQ(ctrl_->getGoalTolerance(), goal_tolerance);
+
+      const auto regular = ctrl_->computeVelocityCommands(robot_pose, speed, &goal_checker_);
+      EXPECT_EQ(regular, candidate.command);
+      EXPECT_DOUBLE_EQ(ctrl_->getGoalTolerance(), 0.05);
+      EXPECT_EQ(ctrl_->getPlan().poses.size(), 3u);
+    }
+  }
+}
+
+TEST_F(CandidateEvaluationTest, both_entrypoints_hold_costmap_during_evaluation)
+{
+  const auto plan = candidatePlan();
+  const auto robot_pose = plan.poses[1];
+  CostmapLockGoalChecker checker(*costmap_->getCostmap()->getMutex());
+  ctrl_->setPlan(plan);
+  ctrl_->setSpeedLimit(0.7, false);
+
+  const auto candidate = ctrl_->evaluateVelocityCommands(
+    plan, 0.7, robot_pose, geometry_msgs::msg::Twist(), &checker);
+  const auto regular = ctrl_->computeVelocityCommands(
+    robot_pose, geometry_msgs::msg::Twist(), &checker);
+  EXPECT_EQ(regular, candidate.command);
+  EXPECT_EQ(checker.locked_during_evaluation, (std::vector<bool>{true, true}));
+
+  // PlannerMgmt also holds this recursive lock around a complete planning cycle.
+  // Both APIs must remain usable when their caller already owns the map.
+  std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> outer_lock(
+    *costmap_->getCostmap()->getMutex());
+  EXPECT_NO_THROW(
+    ctrl_->evaluateVelocityCommands(
+      plan, 0.7, robot_pose, geometry_msgs::msg::Twist(), &goal_checker_));
+  EXPECT_NO_THROW(
+    ctrl_->computeVelocityCommands(robot_pose, geometry_msgs::msg::Twist(), &goal_checker_));
 }
 
 TEST_F(CandidateEvaluationTest, errors_do_not_replace_the_adopted_plan_or_limits)

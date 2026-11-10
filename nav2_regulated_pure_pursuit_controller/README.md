@@ -16,6 +16,14 @@ This controller has been measured to run at well over 1 kHz on a modern intel pr
 
 See its [Configuration Guide Page](https://navigation.ros.org/configuration/packages/configuring-regulated-pp.html) for additional parameter descriptions.
 
+## Local Humble backports
+
+Selected fixes from [Nav2 Humble `3c3db59d`](https://github.com/ros-navigation/navigation2/blob/3c3db59d6969d8ecee8e68468693d006397f4a0c/nav2_regulated_pure_pursuit_controller/src/regulated_pure_pursuit_controller.cpp) are applied while retaining this fork's candidate evaluation API and `max_angular_vel` limit. This remains a 1.1.8-based fork with selected backports.
+
+Rotation to heading reduces commanded angular speed according to the remaining angle and `max_angular_accel`. The stopping bound is applied after acceleration clamping, following Humble's behavior.
+
+Both `computeVelocityCommands()` and `evaluateVelocityCommands()` hold the Costmap mutex while evaluating a command. They acquire the recursive Costmap mutex before the controller mutex, matching PlannerMgmt's outer locking order and allowing calls while the caller already holds the Costmap lock. Candidate evaluation continues to leave the adopted plan, speed limit, and goal tolerance unchanged.
+
 ## Pure Pursuit Basics
 
 The Pure Pursuit algorithm has been in use for over 30 years. You can read more about the details of the pure pursuit controller in its [introduction paper](http://www.enseignement.polytechnique.fr/profs/informatique/Eric.Goubault/MRIS/coulter_r_craig_1992_1.pdf). The core idea is to find a point on the path in front of the robot and find the linear and angular velocity to help drive towards it. Once it moves forward, a new point is selected, and the process repeats until the end of the path. The distance used to find the point to drive towards is the `lookahead` distance. 

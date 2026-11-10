@@ -297,6 +297,8 @@ geometry_msgs::msg::TwistStamped RegulatedPurePursuitController::computeVelocity
   const geometry_msgs::msg::Twist & speed,
   nav2_core::GoalChecker * goal_checker)
 {
+  // Match PlannerMgmt's Costmap -> controller lock order. The Costmap mutex is recursive.
+  std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> costmap_lock(*costmap_->getMutex());
   std::lock_guard<std::mutex> lock_reinit(mutex_);
 
   goal_dist_tol_ = goalDistanceTolerance(goal_checker);
@@ -314,6 +316,8 @@ VelocityCommandEvaluation RegulatedPurePursuitController::evaluateVelocityComman
   const geometry_msgs::msg::PoseStamped & pose,
   const geometry_msgs::msg::Twist & speed, nav2_core::GoalChecker * goal_checker)
 {
+  // Candidate evaluation reads the same Costmap as the normal controller entry point.
+  std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> costmap_lock(*costmap_->getMutex());
   std::lock_guard<std::mutex> lock_reinit(mutex_);
   if (!std::isfinite(speed_limit) || speed_limit < 0.0) {
     throw nav2_core::PlannerException("Invalid candidate speed limit");
@@ -464,6 +468,12 @@ void RegulatedPurePursuitController::rotateToHeading(
   const double min_feasible_angular_speed = curr_speed.angular.z - max_angular_accel_ * dt;
   const double max_feasible_angular_speed = curr_speed.angular.z + max_angular_accel_ * dt;
   angular_vel = std::clamp(angular_vel, min_feasible_angular_speed, max_feasible_angular_speed);
+
+  // Slow down near the target heading so the remaining angle is sufficient to stop.
+  const double max_vel_to_stop = std::sqrt(2.0 * max_angular_accel_ * std::abs(angle_to_path));
+  if (std::abs(angular_vel) > max_vel_to_stop) {
+    angular_vel = sign * max_vel_to_stop;
+  }
 }
 
 geometry_msgs::msg::Point RegulatedPurePursuitController::circleSegmentIntersection(
