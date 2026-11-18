@@ -116,7 +116,7 @@ private:
 protected:
   std::vector<nav2_costmap_2d::Footprint> oriented_footprints_;
   nav2_costmap_2d::Footprint unoriented_footprint_;
-  double footprint_cost_;
+  double center_cost_;
   bool footprint_is_radius_;
   std::vector<float> angles_;
   double possible_inscribed_cost_{-1};

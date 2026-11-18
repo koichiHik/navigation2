@@ -107,10 +107,10 @@ bool GridCollisionChecker::inCollision(
   if (!footprint_is_radius_) {
     // if footprint, then we check for the footprint's points, but first see
     // if the robot is even potentially in an inscribed collision
-    footprint_cost_ = costmap_->getCost(
+    center_cost_ = costmap_->getCost(
       static_cast<unsigned int>(x), static_cast<unsigned int>(y));
 
-    if (footprint_cost_ < possible_inscribed_cost_) {
+    if (center_cost_ < possible_inscribed_cost_) {
       if (possible_inscribed_cost_ > 0) {
         return false;
       } else {
@@ -126,11 +126,11 @@ bool GridCollisionChecker::inCollision(
 
     // If its inscribed, in collision, or unknown in the middle,
     // no need to even check the footprint, its invalid
-    if (footprint_cost_ == UNKNOWN && !traverse_unknown) {
+    if (center_cost_ == UNKNOWN && !traverse_unknown) {
       return true;
     }
 
-    if (footprint_cost_ == INSCRIBED || footprint_cost_ == OCCUPIED) {
+    if (center_cost_ == INSCRIBED || center_cost_ == OCCUPIED) {
       return true;
     }
 
@@ -147,25 +147,26 @@ bool GridCollisionChecker::inCollision(
       current_footprint.push_back(new_pt);
     }
 
-    footprint_cost_ = footprintCost(current_footprint);
+    const double footprint_cost = footprintCost(current_footprint);
 
-    if (footprint_cost_ == UNKNOWN && traverse_unknown) {
+    if (footprint_cost == UNKNOWN && traverse_unknown) {
       return false;
     }
 
-    // if occupied or unknown and not to traverse unknown space
-    return footprint_cost_ >= OCCUPIED;
+    // Keep the polygon cost for collision decisions only. Search traversal
+    // and heuristic costs use the center cell, as for circular robots.
+    return footprint_cost >= OCCUPIED;
   } else {
     // if radius, then we can check the center of the cost assuming inflation is used
-    footprint_cost_ = costmap_->getCost(
+    center_cost_ = costmap_->getCost(
       static_cast<unsigned int>(x), static_cast<unsigned int>(y));
 
-    if (footprint_cost_ == UNKNOWN && traverse_unknown) {
+    if (center_cost_ == UNKNOWN && traverse_unknown) {
       return false;
     }
 
     // if occupied or unknown and not to traverse unknown space
-    return static_cast<double>(footprint_cost_) >= INSCRIBED;
+    return static_cast<double>(center_cost_) >= INSCRIBED;
   }
 }
 
@@ -173,19 +174,19 @@ bool GridCollisionChecker::inCollision(
   const unsigned int & i,
   const bool & traverse_unknown)
 {
-  footprint_cost_ = costmap_->getCost(i);
-  if (footprint_cost_ == UNKNOWN && traverse_unknown) {
+  center_cost_ = costmap_->getCost(i);
+  if (center_cost_ == UNKNOWN && traverse_unknown) {
     return false;
   }
 
   // if occupied or unknown and not to traverse unknown space
-  return footprint_cost_ >= INSCRIBED;
+  return center_cost_ >= INSCRIBED;
 }
 
 float GridCollisionChecker::getCost()
 {
   // Assumes inCollision called prior
-  return static_cast<float>(footprint_cost_);
+  return static_cast<float>(center_cost_);
 }
 
 bool GridCollisionChecker::outsideRange(const unsigned int & max, const float & value)

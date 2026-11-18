@@ -16,9 +16,11 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <utility>
 
 #include "gtest/gtest.h"
 #include "nav2_smac_planner/collision_checker.hpp"
+#include "nav2_costmap_2d/cost_values.hpp"
 #include "nav2_util/lifecycle_node.hpp"
 
 using namespace nav2_costmap_2d;  // NOLINT
@@ -133,13 +135,13 @@ TEST(collision_footprint, test_footprint_at_pose_with_movement)
   float cost = collision_checker.getCost();
   EXPECT_NEAR(cost, 128.0, 0.001);
 
-  collision_checker.inCollision(50, 49, 0.0, false);
+  EXPECT_TRUE(collision_checker.inCollision(50, 49, 0.0, false));
   float up_value = collision_checker.getCost();
-  EXPECT_NEAR(up_value, 254.0, 0.001);
+  EXPECT_NEAR(up_value, 128.0, 0.001);  // Center cost, even when the footprint collides.
 
-  collision_checker.inCollision(50, 52, 0.0, false);
+  EXPECT_TRUE(collision_checker.inCollision(50, 52, 0.0, false));
   float down_value = collision_checker.getCost();
-  EXPECT_NEAR(down_value, 254.0, 0.001);
+  EXPECT_NEAR(down_value, 128.0, 0.001);
   delete costmap_;
 }
 
@@ -174,12 +176,43 @@ TEST(collision_footprint, test_point_and_line_cost)
   float value = collision_checker.getCost();
   EXPECT_NEAR(value, 128.0, 0.001);
 
-  collision_checker.inCollision(49, 50, 0.0, false);
+  EXPECT_TRUE(collision_checker.inCollision(49, 50, 0.0, false));
   float left_value = collision_checker.getCost();
-  EXPECT_NEAR(left_value, 254.0, 0.001);
+  EXPECT_NEAR(left_value, 128.0, 0.001);
 
-  collision_checker.inCollision(52, 50, 0.0, false);
+  EXPECT_TRUE(collision_checker.inCollision(52, 50, 0.0, false));
   float right_value = collision_checker.getCost();
-  EXPECT_NEAR(right_value, 254.0, 0.001);
+  EXPECT_NEAR(right_value, 128.0, 0.001);
   delete costmap_;
+}
+
+TEST(collision_footprint, traversal_cost_uses_center_for_a_free_polygon)
+{
+  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("center_cost");
+  Costmap2D costmap(40, 40, 0.1, 0.0, 0.0, 0);
+  Footprint footprint;
+  for (const auto & xy : std::vector<std::pair<double, double>>{
+    {-0.3, -0.2}, {0.3, -0.2}, {0.3, 0.2}, {-0.3, 0.2}})
+  {
+    geometry_msgs::msg::Point point;
+    point.x = xy.first;
+    point.y = xy.second;
+    footprint.push_back(point);
+  }
+  nav2_smac_planner::GridCollisionChecker checker(&costmap, 72, node);
+  checker.setFootprint(footprint, false, 0.0);
+  costmap.setCost(20, 20, 42);
+  costmap.setCost(23, 20, 200);
+  ASSERT_FALSE(checker.inCollision(20, 20, 0.0, false));
+  EXPECT_FLOAT_EQ(checker.getCost(), 42.0f);
+  costmap.setCost(23, 20, LETHAL_OBSTACLE);
+  EXPECT_TRUE(checker.inCollision(20, 20, 0.0, false));
+  EXPECT_FLOAT_EQ(checker.getCost(), 42.0f);
+  checker.setFootprint({}, true, 0.0);
+  EXPECT_FALSE(checker.inCollision(20, 20, 0.0, false));
+  EXPECT_FLOAT_EQ(checker.getCost(), 42.0f);
+  costmap.setCost(20, 20, NO_INFORMATION);
+  EXPECT_TRUE(checker.inCollision(20, 20, 0.0, false));
+  EXPECT_FALSE(checker.inCollision(20, 20, 0.0, true));
+  EXPECT_FLOAT_EQ(checker.getCost(), NO_INFORMATION);
 }
