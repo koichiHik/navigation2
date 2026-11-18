@@ -14,6 +14,7 @@
 
 #include <math.h>
 #include <memory>
+#include <unordered_map>
 #include <string>
 #include <vector>
 #include <limits>
@@ -305,4 +306,53 @@ TEST(AStarTest, test_constants)
     nav2_smac_planner::fromString(
       "REEDS_SHEPP"), nav2_smac_planner::MotionModel::REEDS_SHEPP);
   EXPECT_EQ(nav2_smac_planner::fromString("NONE"), nav2_smac_planner::MotionModel::UNKNOWN);
+}
+
+TEST(AStarTest, analytic_expansion_restores_revisited_goal)
+{
+  using Node = nav2_smac_planner::NodeHybrid;
+  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("rollback_test");
+  nav2_smac_planner::SearchInfo info;
+  info.minimum_turning_radius = 82.5;
+  info.analytic_expansion_max_length = 200.0;
+  nav2_smac_planner::AStarAlgorithm<Node> a_star(
+    nav2_smac_planner::MotionModel::REEDS_SHEPP, info);
+  int max_iterations = 10000;
+  a_star.initialize(false, max_iterations, 1000, 5.0, 401, 64);
+  nav2_costmap_2d::Costmap2D costmap(1000, 400, 0.1, 0, 0, 0);
+  nav2_smac_planner::GridCollisionChecker checker(&costmap, 64, node);
+  checker.setFootprint({}, true, 0.0);
+  a_star.setCollisionChecker(&checker);
+  Node start(Node::getIndex(537, 125, 16, 1000, 64));
+  Node goal(Node::getIndex(530, 66, 1, 1000, 64));
+  start.pose = {537.454773f, 125.400085f, 16.0f};
+  goal.pose = {530.467102f, 66.557159f, 1.0f};
+  const auto original = goal.pose;
+  std::unordered_map<unsigned int, std::unique_ptr<Node>> nodes;
+  Node::NodePtr start_ptr = &start, goal_ptr = &goal;
+  auto getter = [&](const unsigned int & index, Node::NodePtr & result) {
+      if (index == goal.getIndex()) {
+        result = goal_ptr;
+      } else if (index == start.getIndex()) {
+        result = start_ptr;
+      } else {
+        auto & stored = nodes[index];
+        if (!stored) {stored = std::make_unique<Node>(index);}
+        result = stored.get();
+      }
+      return true;
+    };
+  nav2_smac_planner::AnalyticExpansion<Node> expansion(
+    nav2_smac_planner::MotionModel::REEDS_SHEPP, info, false, 64);
+  expansion.setCollisionChecker(&checker);
+  const auto candidate = expansion.getAnalyticPath(start_ptr, goal_ptr, getter);
+  ASSERT_FALSE(candidate.empty());
+  size_t visits = 0;
+  for (const auto & sample : candidate) {
+    if (sample.node == goal_ptr) {++visits;}
+  }
+  ASSERT_GE(visits, 2u);
+  EXPECT_FLOAT_EQ(goal.pose.x, original.x);
+  EXPECT_FLOAT_EQ(goal.pose.y, original.y);
+  EXPECT_FLOAT_EQ(goal.pose.theta, original.theta);
 }
