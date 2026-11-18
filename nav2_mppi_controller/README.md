@@ -23,6 +23,8 @@ while retaining Humble's controller interface, parameter callbacks, and xtensor 
 
 - [#6537](https://github.com/ros-navigation/navigation2/pull/6537): clear rollout costs before every optimization iteration instead of accumulating older batches when `iteration_count > 1`.
 
+- [#6768](https://github.com/ros-navigation/navigation2/pull/6768): synchronize noise-worker shutdown flags and condition-variable waits so `regenerate_noises: true` cannot lose the shutdown notification.
+
 These changes do not add main's newer controller API, motion models, or final optimized-trajectory validator. MPPI still requires the caller's motion validation before commands are used by the future recovery implementation.
 
 ![](media/demo.gif)

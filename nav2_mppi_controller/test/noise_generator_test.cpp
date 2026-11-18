@@ -129,3 +129,24 @@ TEST(NoiseGeneratorTest, NoiseGeneratorMain)
 
   generator.shutdown();
 }
+
+TEST(NoiseGeneratorTest, ShutdownWithRegeneratedNoisesDoesNotHang)
+{
+  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("noise_shutdown_race");
+  node->declare_parameter("mppi.regenerate_noises", true);
+  ParametersHandler handler(node);
+  models::OptimizerSettings settings;
+  settings.batch_size = 4;
+  settings.time_steps = 3;
+  settings.sampling_std.vx = 0.1f;
+  settings.sampling_std.wz = 0.1f;
+  NoiseGenerator generator;
+  // Exercise shutdown both during generation and around the worker's next wait.
+  // The test runner timeout also catches an indefinitely blocked join().
+  for (size_t i = 0; i < 4000; ++i) {
+    generator.initialize(settings, false, "mppi", &handler);
+    generator.generateNextNoises();
+    std::this_thread::sleep_for(std::chrono::microseconds(i % 64));
+    generator.shutdown();
+  }
+}
