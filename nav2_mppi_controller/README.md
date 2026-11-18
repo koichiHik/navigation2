@@ -17,6 +17,8 @@ while retaining Humble's controller interface, parameter callbacks, and xtensor 
 
 - [#6055](https://github.com/ros-navigation/navigation2/pull/6055): bound critic path progress by each candidate trajectory's arc-length so nearby later branches of curved paths are not skipped. Adapted to Humble's xtensor implementation.
 
+- [#6700](https://github.com/ros-navigation/navigation2/pull/6700): keep `motion_model` and `VelocityDeadbandCritic.deadband_velocities` static so callbacks never retain references to configuration-time stack variables. Humble ignores their runtime updates; reconfiguration is required. Humble has no PathAngleCritic `mode` parameter.
+
 These changes do not add main's newer controller API, motion models, or final optimized-trajectory validator. MPPI still requires the caller's motion validation before commands are used by the future recovery implementation.
 
 ![](media/demo.gif)

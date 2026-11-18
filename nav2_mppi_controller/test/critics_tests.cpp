@@ -19,6 +19,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "nav2_mppi_controller/tools/utils.hpp"
 #include "nav2_mppi_controller/motion_models.hpp"
+#include "nav2_mppi_controller/optimizer.hpp"
 #include "nav2_mppi_controller/critics/constraint_critic.hpp"
 #include "nav2_mppi_controller/critics/goal_angle_critic.hpp"
 #include "nav2_mppi_controller/critics/goal_critic.hpp"
@@ -42,6 +43,57 @@ using namespace mppi;  // NOLINT
 using namespace mppi::critics;  // NOLINT
 using namespace mppi::utils;  // NOLINT
 using xt::evaluation_strategy::immediate;
+
+class ParameterRegistrationInspector : public ParametersHandler
+{
+public:
+  using ParametersHandler::ParametersHandler;
+
+  bool isDynamic(const std::string & name) const
+  {
+    return get_param_callbacks_.count(name) != 0;
+  }
+};
+
+TEST(CriticTests, ConfigureLocalsDoNotBecomeDynamicTargets)
+{
+  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("static_mppi_parameters");
+  node->declare_parameter("controller_frequency", 20.0);
+  node->declare_parameter("critic.deadband_velocities", std::vector<double>{0.08, 0.08, 0.08});
+  auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
+    "dummy_costmap", "", "dummy_costmap");
+  costmap->on_configure(rclcpp_lifecycle::State{});
+  ParameterRegistrationInspector handler(node);
+  Optimizer optimizer;
+  optimizer.initialize(node, "mppi", costmap, &handler);
+  VelocityDeadbandCritic critic;
+  critic.on_configure(node, "mppi", "critic", costmap, &handler);
+
+  // These getters used stack objects. A dynamic callback would outlive its target.
+  ASSERT_FALSE(handler.isDynamic("mppi.motion_model"));
+  ASSERT_FALSE(handler.isDynamic("critic.deadband_velocities"));
+  handler.start();
+  EXPECT_NO_THROW(node->set_parameters({
+      rclcpp::Parameter("mppi.motion_model", "Omni"),
+      rclcpp::Parameter("critic.deadband_velocities", std::vector<double>{0.2, 0.2, 0.2})}));
+
+  // Humble static parameters require reconfiguration; live critic settings stay intact.
+  models::State state;
+  state.reset(1, 1);
+  state.vx.fill(0.1f);
+  state.vy.fill(0.1f);
+  state.wz.fill(0.1f);
+  models::Trajectories trajectories;
+  models::Path path;
+  xt::xtensor<float, 1> costs = xt::zeros<float>({1});
+  float model_dt = 0.1f;
+  CriticData data = {state, trajectories, path, costs, model_dt, false, nullptr, nullptr,
+    std::nullopt, std::nullopt};
+  data.motion_model = std::make_shared<OmniMotionModel>();
+  critic.score(data);
+  EXPECT_FLOAT_EQ(costs(0), 0.0f);
+  optimizer.shutdown();
+}
 
 TEST(CriticTests, ConstraintsCritic)
 {
