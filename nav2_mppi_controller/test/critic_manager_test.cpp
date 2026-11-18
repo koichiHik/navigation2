@@ -18,6 +18,7 @@
 #include "gtest/gtest.h"
 #include "rclcpp/rclcpp.hpp"
 #include "nav2_mppi_controller/critic_manager.hpp"
+#include "nav2_core/exceptions.hpp"
 
 // Tests critic manager
 
@@ -135,4 +136,36 @@ TEST(CriticManagerTests, CriticLoadingTest)
   CriticManagerWrapperEnum critic_manager;
   critic_manager.on_configure(node, "critic_manager", costmap_ros, &param_handler);
   EXPECT_EQ(critic_manager.getCriticNum(), 2u);
+}
+
+class FailingCriticManager : public CriticManager
+{
+public:
+  FailingCriticManager()
+  {
+    loader_ = std::make_unique<pluginlib::ClassLoader<critics::CriticFunction>>(
+      "nav2_mppi_controller", "mppi::critics::CriticFunction", "plugin",
+      std::vector<std::string>{MPPI_FAILING_CRITIC_XML});
+  }
+};
+
+TEST(CriticManagerTests, ConfigurationExceptionIsOwnedByControllerLibrary)
+{
+  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("critic_exception_test");
+  node->declare_parameter("mppi.critics", std::vector<std::string>{"ThrowingTestCritic"});
+  auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
+    "dummy_costmap", "", "dummy_costmap");
+  costmap->on_configure(rclcpp_lifecycle::State{});
+  auto handler = std::make_unique<ParametersHandler>(node);
+  FailingCriticManager manager;
+  try {
+    manager.on_configure(node, "mppi", costmap, handler.get());
+    FAIL() << "The test critic must reject configuration";
+  } catch (const nav2_core::PlannerException & error) {
+    // The plugin throws std::runtime_error; the controller must create its own exception.
+    EXPECT_STREQ(error.what(), "test critic configuration failed");
+  } catch (const std::exception & error) {
+    FAIL() << "Plugin exception escaped without conversion: " << error.what();
+  }
+  handler.reset();
 }

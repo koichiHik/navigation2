@@ -21,6 +21,7 @@
 #include <nav2_costmap_2d/costmap_2d_ros.hpp>
 
 #include "nav2_mppi_controller/controller.hpp"
+#include "nav2_core/exceptions.hpp"
 
 #include "utils/utils.hpp"
 
@@ -159,4 +160,26 @@ TEST_F(ControllerSpeedLimitTest, OtherNamespacesPreserveLimitAndOwnUpdatesReset)
   result = node_->set_parameter(rclcpp::Parameter("mppic.temperature", 0.4));
   ASSERT_TRUE(result.successful);
   EXPECT_NEAR(commandVelocity(), 0.5, 1e-6);
+}
+
+TEST(ControllerStateTransitionTest, FailedConfigurationCanUnwindWithoutCleanup)
+{
+  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("failed_configure_test");
+  node->declare_parameter("controller_frequency", 20.0);
+  node->declare_parameter("mppic.critics", std::vector<std::string>{"CostCritic"});
+  node->declare_parameter("mppic.CostCritic.consider_footprint", true);
+  auto tf_buffer = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+  // Default radius geometry intentionally conflicts with consider_footprint=true.
+  auto costmap = getDummyCostmapRos();
+  ASSERT_TRUE(costmap->getUseRadius());
+  pluginlib::ClassLoader<nav2_core::Controller> loader("nav2_core", "nav2_core::Controller");
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    try {
+      auto controller = loader.createUniqueInstance("nav2_mppi_controller::MPPIController");
+      controller->configure(node, "mppic", tf_buffer, costmap);
+      FAIL() << "Radius geometry must reject polygon footprint checking";
+    } catch (const nav2_core::PlannerException & error) {
+      EXPECT_NE(std::string(error.what()).find("no robot footprint"), std::string::npos);
+    }
+  }
 }

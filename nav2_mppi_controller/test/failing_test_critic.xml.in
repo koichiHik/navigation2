@@ -1,0 +1,5 @@
+<library path="mppi_failing_test_critic">
+  <class type="mppi::critics::ThrowingTestCritic" base_class_type="mppi::critics::CriticFunction">
+    <description>Test-only critic which throws during configuration.</description>
+  </class>
+</library>
