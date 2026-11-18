@@ -47,6 +47,8 @@ public:
   : nav2_smac_planner::Smoother(params)
   {}
 
+  using nav2_smac_planner::Smoother::findBoundaryExpansion;
+
   std::vector<PathSegment> findDirectionalPathSegmentsWrapper(nav_msgs::msg::Path path)
   {
     return findDirectionalPathSegments(path);
@@ -240,4 +242,33 @@ TEST(SmootherTest, test_full_smoother)
   EXPECT_NEAR(plan.poses.end()[-2].pose.orientation.w, 0.0, 1e-3);
 
   delete costmap;
+}
+
+TEST(SmootherTest, boundary_expansion_rejects_out_of_map_samples)
+{
+  SmootherParams params;
+  SmootherWrapper smoother(params);
+  smoother.initialize(0.4);
+  nav2_costmap_2d::Costmap2D costmap(10, 10, 0.1, 0.0, 0.0, 0);
+  geometry_msgs::msg::Pose start, end;
+  start.position.x = 0.8;
+  start.position.y = 0.25;
+  start.orientation.w = 1.0;
+  end = start;
+  end.position.x = 1.2;
+  BoundaryExpansion outside;
+  outside.path_end_idx = 4.0;
+  outside.original_path_length = 1.0;
+  smoother.findBoundaryExpansion(start, end, outside, &costmap);
+  ASSERT_EQ(outside.pts.size(), 5u);
+  EXPECT_TRUE(outside.in_collision);
+
+  start.position.x = 0.2;
+  end.position.x = 0.6;
+  BoundaryExpansion inside;
+  inside.path_end_idx = 4.0;
+  inside.original_path_length = 1.0;
+  smoother.findBoundaryExpansion(start, end, inside, &costmap);
+  ASSERT_EQ(inside.pts.size(), 5u);
+  EXPECT_FALSE(inside.in_collision);
 }
