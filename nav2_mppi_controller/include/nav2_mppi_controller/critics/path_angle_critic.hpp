@@ -48,7 +48,7 @@ protected:
   float threshold_to_consider_{0};
 
   size_t offset_from_furthest_{0};
-  bool reversing_allowed_{true};
+  float vx_min_{0};
   bool forward_preference_{true};
 
   unsigned int power_{0};

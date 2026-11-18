@@ -19,6 +19,8 @@ while retaining Humble's controller interface, parameter callbacks, and xtensor 
 
 - [#6700](https://github.com/ros-navigation/navigation2/pull/6700): keep `motion_model` and `VelocityDeadbandCritic.deadband_velocities` static so callbacks never retain references to configuration-time stack variables. Humble ignores their runtime updates; reconfiguration is required. Humble has no PathAngleCritic `mode` parameter.
 
+- [#6775](https://github.com/ros-navigation/navigation2/pull/6775): deliver shared dynamic parameters to every reader. ConstraintCritic and PathAngleCritic retain member storage and evaluate updated limits/preferences safely; custom callbacks keep exclusive ownership. Temporary speed-limit updates remain separate from configured critic limits.
+
 These changes do not add main's newer controller API, motion models, or final optimized-trajectory validator. MPPI still requires the caller's motion validation before commands are used by the future recovery implementation.
 
 ![](media/demo.gif)

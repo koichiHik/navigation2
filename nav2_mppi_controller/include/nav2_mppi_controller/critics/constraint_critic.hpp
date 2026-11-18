@@ -15,6 +15,8 @@
 #ifndef NAV2_MPPI_CONTROLLER__CRITICS__CONSTRAINT_CRITIC_HPP_
 #define NAV2_MPPI_CONTROLLER__CRITICS__CONSTRAINT_CRITIC_HPP_
 
+#include <cmath>
+
 #include "nav2_mppi_controller/critic_function.hpp"
 #include "nav2_mppi_controller/models/state.hpp"
 #include "nav2_mppi_controller/tools/utils.hpp"
@@ -41,14 +43,18 @@ public:
    */
   void score(CriticData & data) override;
 
-  float getMaxVelConstraint() {return max_vel_;}
-  float getMinVelConstraint() {return min_vel_;}
+  float getMaxVelConstraint() const {return std::hypot(vx_max_, vy_max_);}
+  float getMinVelConstraint() const
+  {
+    return (vx_min_ > 0.0f ? 1.0f : -1.0f) * std::hypot(vx_min_, vy_max_);
+  }
 
 protected:
   unsigned int power_{0};
   float weight_{0};
-  float min_vel_;
-  float max_vel_;
+  float vx_max_{0};
+  float vx_min_{0};
+  float vy_max_{0};
 };
 
 }  // namespace mppi::critics

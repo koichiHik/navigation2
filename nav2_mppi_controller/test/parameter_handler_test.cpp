@@ -210,3 +210,29 @@ TEST(ParameterHandlerTest, DynamicAndStaticParametersTest)
   EXPECT_EQ(p1, 10);
   EXPECT_EQ(p2, 7);
 }
+
+TEST(ParameterHandlerTest, SharedReadersAndExclusiveOverride)
+{
+  ParametersHandlerWrapper handler;
+  double first = 0.0, second = 0.0, overridden = 0.0;
+  handler.setDynamicParamCallback(first, "shared");
+  handler.setDynamicParamCallback(second, "shared");
+  handler.setDynamicParamCallback(first, "shared");
+  handler.dynamicParamsCallback({rclcpp::Parameter("shared", 2.0)});
+  EXPECT_DOUBLE_EQ(first, 2.0);
+  EXPECT_DOUBLE_EQ(second, 2.0);
+
+  // Custom normalization callbacks retain exclusive ownership of their parameter.
+  int override_count = 0;
+  handler.addDynamicParamCallback(
+    "shared", [&](const rclcpp::Parameter & parameter) {
+      overridden = parameter.as_double() / 2.0;
+      ++override_count;
+    });
+  handler.setDynamicParamCallback(second, "shared");
+  handler.dynamicParamsCallback({rclcpp::Parameter("shared", 8.0)});
+  EXPECT_EQ(override_count, 1);
+  EXPECT_DOUBLE_EQ(overridden, 4.0);
+  EXPECT_DOUBLE_EQ(first, 2.0);
+  EXPECT_DOUBLE_EQ(second, 2.0);
+}

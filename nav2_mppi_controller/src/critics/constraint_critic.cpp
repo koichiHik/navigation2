@@ -28,14 +28,9 @@ void ConstraintCritic::initialize()
     logger_, "ConstraintCritic instantiated with %d power and %f weight.",
     power_, weight_);
 
-  float vx_max, vy_max, vx_min;
-  getParentParam(vx_max, "vx_max", 0.5);
-  getParentParam(vy_max, "vy_max", 0.0);
-  getParentParam(vx_min, "vx_min", -0.35);
-
-  const float min_sgn = vx_min > 0.0 ? 1.0 : -1.0;
-  max_vel_ = sqrtf(vx_max * vx_max + vy_max * vy_max);
-  min_vel_ = min_sgn * sqrtf(vx_min * vx_min + vy_max * vy_max);
+  getParentParam(vx_max_, "vx_max", 0.5);
+  getParentParam(vy_max_, "vy_max", 0.0);
+  getParentParam(vx_min_, "vx_min", -0.35);
 }
 
 void ConstraintCritic::score(CriticData & data)
@@ -48,8 +43,8 @@ void ConstraintCritic::score(CriticData & data)
 
   auto sgn = xt::where(data.state.vx > 0.0, 1.0, -1.0);
   auto vel_total = sgn * xt::sqrt(data.state.vx * data.state.vx + data.state.vy * data.state.vy);
-  auto out_of_max_bounds_motion = xt::maximum(vel_total - max_vel_, 0);
-  auto out_of_min_bounds_motion = xt::maximum(min_vel_ - vel_total, 0);
+  auto out_of_max_bounds_motion = xt::maximum(vel_total - getMaxVelConstraint(), 0);
+  auto out_of_min_bounds_motion = xt::maximum(getMinVelConstraint() - vel_total, 0);
 
   auto acker = dynamic_cast<AckermannMotionModel *>(data.motion_model.get());
   if (acker != nullptr) {

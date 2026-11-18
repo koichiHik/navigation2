@@ -15,6 +15,7 @@
 #ifndef NAV2_MPPI_CONTROLLER__TOOLS__PARAMETERS_HANDLER_HPP_
 #define NAV2_MPPI_CONTROLLER__TOOLS__PARAMETERS_HANDLER_HPP_
 
+#include <algorithm>
 #include <functional>
 #include <string>
 #include <type_traits>
@@ -164,7 +165,8 @@ protected:
 
   bool verbose_{false};
 
-  std::unordered_map<std::string, std::function<get_param_func_t>>
+  using ParamCallback = std::function<get_param_func_t>;
+  std::unordered_map<std::string, std::vector<std::pair<const void *, ParamCallback>>>
   get_param_callbacks_;
 
   std::vector<std::function<pre_callback_t>> pre_callbacks_;
@@ -185,7 +187,7 @@ inline auto ParametersHandler::getParamGetter(const std::string & ns)
 template<typename T>
 void ParametersHandler::addDynamicParamCallback(const std::string & name, T && callback)
 {
-  get_param_callbacks_[name] = callback;
+  get_param_callbacks_[name] = {{nullptr, callback}};
 }
 
 template<typename T>
@@ -230,8 +232,16 @@ void ParametersHandler::setParam(
 template<typename T>
 void ParametersHandler::setDynamicParamCallback(T & setting, const std::string & name)
 {
-  if (get_param_callbacks_.find(name) != get_param_callbacks_.end()) {
-    return;
+  const void * key = &setting;
+  if (auto it = get_param_callbacks_.find(name); it != get_param_callbacks_.end()) {
+    const auto & callbacks = it->second;
+    if (std::any_of(
+        callbacks.begin(), callbacks.end(), [key](const auto & callback) {
+          return callback.first == nullptr || callback.first == key;
+        }))
+    {
+      return;
+    }
   }
 
   auto callback = [this, &setting, name](const rclcpp::Parameter & param) {
@@ -242,7 +252,7 @@ void ParametersHandler::setDynamicParamCallback(T & setting, const std::string &
       }
     };
 
-  addDynamicParamCallback(name, callback);
+  get_param_callbacks_[name].emplace_back(key, callback);
 
   if (verbose_) {
     RCLCPP_INFO(logger_, "Dynamic Parameter added %s", name.c_str());

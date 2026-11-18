@@ -44,57 +44,6 @@ using namespace mppi::critics;  // NOLINT
 using namespace mppi::utils;  // NOLINT
 using xt::evaluation_strategy::immediate;
 
-class ParameterRegistrationInspector : public ParametersHandler
-{
-public:
-  using ParametersHandler::ParametersHandler;
-
-  bool isDynamic(const std::string & name) const
-  {
-    return get_param_callbacks_.count(name) != 0;
-  }
-};
-
-TEST(CriticTests, ConfigureLocalsDoNotBecomeDynamicTargets)
-{
-  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("static_mppi_parameters");
-  node->declare_parameter("controller_frequency", 20.0);
-  node->declare_parameter("critic.deadband_velocities", std::vector<double>{0.08, 0.08, 0.08});
-  auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
-    "dummy_costmap", "", "dummy_costmap");
-  costmap->on_configure(rclcpp_lifecycle::State{});
-  ParameterRegistrationInspector handler(node);
-  Optimizer optimizer;
-  optimizer.initialize(node, "mppi", costmap, &handler);
-  VelocityDeadbandCritic critic;
-  critic.on_configure(node, "mppi", "critic", costmap, &handler);
-
-  // These getters used stack objects. A dynamic callback would outlive its target.
-  ASSERT_FALSE(handler.isDynamic("mppi.motion_model"));
-  ASSERT_FALSE(handler.isDynamic("critic.deadband_velocities"));
-  handler.start();
-  EXPECT_NO_THROW(node->set_parameters({
-      rclcpp::Parameter("mppi.motion_model", "Omni"),
-      rclcpp::Parameter("critic.deadband_velocities", std::vector<double>{0.2, 0.2, 0.2})}));
-
-  // Humble static parameters require reconfiguration; live critic settings stay intact.
-  models::State state;
-  state.reset(1, 1);
-  state.vx.fill(0.1f);
-  state.vy.fill(0.1f);
-  state.wz.fill(0.1f);
-  models::Trajectories trajectories;
-  models::Path path;
-  xt::xtensor<float, 1> costs = xt::zeros<float>({1});
-  float model_dt = 0.1f;
-  CriticData data = {state, trajectories, path, costs, model_dt, false, nullptr, nullptr,
-    std::nullopt, std::nullopt};
-  data.motion_model = std::make_shared<OmniMotionModel>();
-  critic.score(data);
-  EXPECT_FLOAT_EQ(costs(0), 0.0f);
-  optimizer.shutdown();
-}
-
 TEST(CriticTests, ConstraintsCritic)
 {
   // Standard preamble
@@ -865,4 +814,118 @@ TEST(CriticTests, VelocityDeadbandCritic)
   critic.score(data);
   // 35.0 weight * 0.1 model_dt * (0.07 + 0.06 + 0.059) * 30 timesteps = 56.7
   EXPECT_NEAR(costs(1), 19.845, 0.01);
+}
+
+class ParameterRegistrationInspector : public ParametersHandler
+{
+public:
+  using ParametersHandler::ParametersHandler;
+
+  bool isDynamic(const std::string & name) const
+  {
+    return get_param_callbacks_.count(name) != 0;
+  }
+};
+
+TEST(CriticTests, ConfigureLocalsDoNotBecomeDynamicTargets)
+{
+  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("static_mppi_parameters");
+  node->declare_parameter("controller_frequency", 20.0);
+  node->declare_parameter("critic.deadband_velocities", std::vector<double>{0.08, 0.08, 0.08});
+  auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
+    "dummy_costmap", "", "dummy_costmap");
+  costmap->on_configure(rclcpp_lifecycle::State{});
+  ParameterRegistrationInspector handler(node);
+  Optimizer optimizer;
+  optimizer.initialize(node, "mppi", costmap, &handler);
+  VelocityDeadbandCritic critic;
+  critic.on_configure(node, "mppi", "critic", costmap, &handler);
+
+  // These getters used stack objects. A dynamic callback would outlive its target.
+  ASSERT_FALSE(handler.isDynamic("mppi.motion_model"));
+  ASSERT_FALSE(handler.isDynamic("critic.deadband_velocities"));
+  handler.start();
+  const std::vector<rclcpp::Parameter> updates{
+    rclcpp::Parameter("mppi.motion_model", "Omni"),
+    rclcpp::Parameter("critic.deadband_velocities", std::vector<double>{0.2, 0.2, 0.2})};
+  EXPECT_NO_THROW(node->set_parameters(updates));
+
+  // Humble static parameters require reconfiguration; live critic settings stay intact.
+  models::State state;
+  state.reset(1, 1);
+  state.vx.fill(0.1f);
+  state.vy.fill(0.1f);
+  state.wz.fill(0.1f);
+  models::Trajectories trajectories;
+  models::Path path;
+  xt::xtensor<float, 1> costs = xt::zeros<float>({1});
+  float model_dt = 0.1f;
+  CriticData data = {state, trajectories, path, costs, model_dt, false, nullptr, nullptr,
+    std::nullopt, std::nullopt};
+  data.motion_model = std::make_shared<OmniMotionModel>();
+  critic.score(data);
+  EXPECT_FLOAT_EQ(costs(0), 0.0f);
+  optimizer.shutdown();
+}
+
+TEST(CriticTests, SharedDynamicLimitsReachEveryCritic)
+{
+  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("shared_mppi_parameters");
+  node->declare_parameter("angle.forward_preference", false);
+  auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
+    "dummy_costmap", "", "dummy_costmap");
+  costmap->on_configure(rclcpp_lifecycle::State{});
+  ParametersHandler handler(node);
+  // Register the optimizer's readers before the critics, as in real configuration.
+  float optimizer_max, optimizer_min, optimizer_vy;
+  auto getParent = handler.getParamGetter("mppi");
+  getParent(optimizer_max, "vx_max", 0.5);
+  getParent(optimizer_min, "vx_min", -0.35);
+  getParent(optimizer_vy, "vy_max", 0.0);
+  ConstraintCritic constraint;
+  constraint.on_configure(node, "mppi", "constraint", costmap, &handler);
+  PathAngleCritic angle;
+  angle.on_configure(node, "mppi", "angle", costmap, &handler);
+  handler.start();
+
+  models::State state;
+  state.reset(1, 2);
+  state.vx.fill(0.8f);
+  models::Trajectories trajectories;
+  trajectories.reset(1, 2);
+  models::Path path;
+  path.reset(5);
+  path.x.fill(-1.0f);
+  xt::xtensor<float, 1> costs = xt::zeros<float>({1});
+  float model_dt = 0.1f;
+  CriticData data = {state, trajectories, path, costs, model_dt, false, nullptr, nullptr,
+    std::nullopt, std::nullopt};
+  data.motion_model = std::make_shared<DiffDriveMotionModel>();
+  constraint.score(data);
+  EXPECT_NEAR(costs(0), 0.24f, 1e-5);
+  ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("mppi.vx_max", 1.0)).successful);
+  costs.fill(0.0f);
+  constraint.score(data);
+  EXPECT_FLOAT_EQ(costs(0), 0.0f);
+  EXPECT_FLOAT_EQ(optimizer_max, 1.0f);
+
+  // Reversibility can be disabled and restored without losing configured preference.
+  costs.fill(0.0f);
+  data.furthest_reached_path_point = 0;
+  state.pose.pose.orientation.w = 1.0;
+  angle.score(data);
+  EXPECT_FLOAT_EQ(costs(0), 0.0f);
+  ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("mppi.vx_min", 0.0)).successful);
+  angle.score(data);
+  EXPECT_GT(costs(0), 0.0f);
+  EXPECT_FLOAT_EQ(optimizer_min, 0.0f);
+  costs.fill(0.0f);
+  ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("mppi.vx_min", -0.35)).successful);
+  angle.score(data);
+  EXPECT_FLOAT_EQ(costs(0), 0.0f);
+
+  // The second shared axis also updates the constraint's derived norm.
+  ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("mppi.vy_max", 0.5)).successful);
+  EXPECT_NEAR(constraint.getMaxVelConstraint(), std::hypot(1.0f, 0.5f), 1e-6);
+  EXPECT_FLOAT_EQ(optimizer_vy, 0.5f);
 }

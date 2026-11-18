@@ -80,7 +80,9 @@ ParametersHandler::dynamicParamsCallback(
     if (auto callback = get_param_callbacks_.find(param_name);
       callback != get_param_callbacks_.end())
     {
-      callback->second(param);
+      for (const auto & reader : callback->second) {
+        reader.second(param);
+      }
     }
   }
 
