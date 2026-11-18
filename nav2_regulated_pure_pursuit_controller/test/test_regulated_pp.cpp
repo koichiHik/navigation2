@@ -1712,6 +1712,30 @@ TEST_F(CandidateEvaluationTest, candidates_preserve_state_and_match_regular_comm
   EXPECT_EQ(ctrl_->getPlan().poses.size(), 3u);
 }
 
+TEST_F(CandidateEvaluationTest, dynamic_approach_distance_updates_both_entrypoints)
+{
+  const auto plan = candidatePlan(0.0);
+  const auto robot_pose = plan.poses[1];
+  const geometry_msgs::msg::Twist speed;
+
+  // The endpoint is 1.5 m away: increasing the approach distance must start
+  // slowing immediately, and decreasing it must restore the desired speed.
+  for (const auto & setting : std::vector<std::pair<double, double>>{
+    {0.75, 1.0}, {3.0, 0.5}, {0.75, 1.0}})
+  {
+    update({rclcpp::Parameter("test_rpp.approach_velocity_scaling_dist", setting.first)});
+    ctrl_->setPlan(plan);
+    const auto candidate = ctrl_->evaluateVelocityCommands(
+      plan, 1.0, robot_pose, speed, &goal_checker_);
+    EXPECT_NEAR(candidate.command.twist.linear.x, setting.second, 1e-12);
+    EXPECT_EQ(ctrl_->getPlan(), plan);
+    EXPECT_DOUBLE_EQ(ctrl_->getSpeed(), 1.0);
+
+    const auto regular = ctrl_->computeVelocityCommands(robot_pose, speed, &goal_checker_);
+    EXPECT_EQ(regular, candidate.command);
+  }
+}
+
 TEST_F(CandidateEvaluationTest, rotation_braking_preserves_candidate_state_and_angular_limit)
 {
   update(

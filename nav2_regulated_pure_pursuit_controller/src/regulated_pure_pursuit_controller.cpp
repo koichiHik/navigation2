@@ -1156,6 +1156,8 @@ RegulatedPurePursuitController::dynamicParametersCallback(
         rotate_to_heading_angular_vel_ = parameter.as_double();
       } else if (name == plugin_name_ + ".min_approach_linear_velocity") {
         min_approach_linear_velocity_ = parameter.as_double();
+      } else if (name == plugin_name_ + ".approach_velocity_scaling_dist") {
+        approach_velocity_scaling_dist_ = parameter.as_double();
       } else if (name == plugin_name_ + ".max_allowed_time_to_collision_up_to_carrot") {
         max_allowed_time_to_collision_up_to_carrot_ = parameter.as_double();
       } else if (name == plugin_name_ + ".cost_scaling_dist") {

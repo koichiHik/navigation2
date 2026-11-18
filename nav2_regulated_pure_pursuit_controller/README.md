@@ -24,6 +24,8 @@ Rotation to heading reduces commanded angular speed according to the remaining a
 
 Both `computeVelocityCommands()` and `evaluateVelocityCommands()` hold the Costmap mutex while evaluating a command. They acquire the recursive Costmap mutex before the controller mutex, matching PlannerMgmt's outer locking order and allowing calls while the caller already holds the Costmap lock. Candidate evaluation continues to leave the adopted plan, speed limit, and goal tolerance unchanged.
 
+The dynamic-parameter fix from [Nav2 PR #5711](https://github.com/ros-navigation/navigation2/pull/5711) is backported: changing `approach_velocity_scaling_dist` while the controller is active immediately updates approach-speed scaling for both command entry points.
+
 ### Selected main-branch path fixes
 
 The rotation-cusp detection from [Nav2 PR #3934](https://github.com/ros-navigation/navigation2/pull/3934) is adapted locally: repeated XY positions with changed yaw are detected as a cusp, while repeated positions with the same yaw are ignored. Empty and short paths are handled without unsigned-index underflow. When reversing is enabled, the last equally close pose is selected locally so an in-place rotation's duplicate positions can be passed. The shared `nav2_util::min_by` implementation is unchanged, and ordinary forward tracking retains its existing tie behavior.
