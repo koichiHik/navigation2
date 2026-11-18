@@ -92,6 +92,57 @@ TEST(NodeLatticeTest, parser_test)
   EXPECT_NEAR(myPrimitives[0].poses[1]._theta, 6.09345, 0.015);
 }
 
+TEST(NodeLatticeTest, dynamic_parameters_with_unchanged_lattice)
+{
+  nav2_smac_planner::SearchInfo info{};
+  info.lattice_filepath = ament_index_cpp::get_package_share_directory("nav2_smac_planner") +
+    "/sample_primitives/5cm_resolution/0.5m_turning_radius/ackermann/output.json";
+  info.change_penalty = 0.0;
+  info.non_straight_penalty = 1.0;
+  info.cost_penalty = 1.0;
+  info.reverse_penalty = 1.0;
+  info.retrospective_penalty = 0.0;
+  info.rotation_penalty = 1.0;
+  info.allow_reverse_expansion = true;
+
+  unsigned int size_x = 100;
+  nav2_smac_planner::LatticeMotionTable table;
+  table.initMotionModel(size_x, info);
+  nav2_smac_planner::NodeLattice node(0);
+  node.pose.theta = 0;
+  const auto forward_count = table.motion_primitives.front().size();
+  const auto * first_primitive = &table.motion_primitives.front().front();
+  EXPECT_EQ(table.getMotionPrimitives(&node).size(), 2 * forward_count);
+
+  // Reconfiguring penalties and reverse expansion must not require a new JSON file.
+  info.change_penalty = 0.5;
+  info.non_straight_penalty = 1.5;
+  info.cost_penalty = 2.0;
+  info.reverse_penalty = 3.0;
+  info.retrospective_penalty = 0.2;
+  info.rotation_penalty = 4.0;
+  info.allow_reverse_expansion = false;
+  size_x = 200;
+  table.initMotionModel(size_x, info);
+
+  EXPECT_EQ(table.size_x, size_x);
+  EXPECT_FLOAT_EQ(table.change_penalty, 0.5);
+  EXPECT_FLOAT_EQ(table.non_straight_penalty, 1.5);
+  EXPECT_FLOAT_EQ(table.cost_penalty, 2.0);
+  EXPECT_FLOAT_EQ(table.reverse_penalty, 3.0);
+  EXPECT_FLOAT_EQ(table.travel_distance_reward, 0.8);
+  EXPECT_FLOAT_EQ(table.rotation_penalty, 4.0);
+  EXPECT_EQ(table.getMotionPrimitives(&node).size(), forward_count);
+  EXPECT_EQ(&table.motion_primitives.front().front(), first_primitive);
+  EXPECT_EQ(table.motion_primitives.size(), table.lattice_metadata.number_of_headings);
+
+  info.allow_reverse_expansion = true;
+  info.reverse_penalty = 5.0;
+  table.initMotionModel(size_x, info);
+  EXPECT_EQ(table.getMotionPrimitives(&node).size(), 2 * forward_count);
+  EXPECT_FLOAT_EQ(table.reverse_penalty, 5.0);
+}
+
 TEST(NodeLatticeTest, test_node_lattice_neighbors_and_parsing)
 {
   std::string pkg_share_dir = ament_index_cpp::get_package_share_directory("nav2_smac_planner");
