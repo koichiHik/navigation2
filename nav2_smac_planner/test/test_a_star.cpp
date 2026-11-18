@@ -122,6 +122,46 @@ TEST(AStarTest, test_a_star_2d)
   delete costmapA;
 }
 
+TEST(AStarTest, timeout_returns_only_a_path_within_tolerance)
+{
+  auto lnode = std::make_shared<rclcpp_lifecycle::LifecycleNode>("test");
+  nav2_costmap_2d::Costmap2D costmap(20, 20, 0.1, 0.0, 0.0, 0);
+  costmap.setCost(4, 2, nav2_costmap_2d::LETHAL_OBSTACLE);
+  nav2_smac_planner::GridCollisionChecker checker(&costmap, 1, lnode);
+  checker.setFootprint(nav2_costmap_2d::Footprint(), true, 0.0);
+
+  for (const float tolerance : {2.0f, 0.5f}) {
+    nav2_smac_planner::SearchInfo info{};
+    nav2_smac_planner::AStarAlgorithm<nav2_smac_planner::Node2D> a_star(
+      nav2_smac_planner::MotionModel::TWOD, info);
+    int max_iterations = 10000;
+    a_star.initialize(false, max_iterations, 100, 0.0, 0.0, 1);
+    a_star.setCollisionChecker(&checker);
+    a_star.setStart(2, 2, 0);
+    a_star.setGoal(4, 2, 0);
+
+    // Allow exactly one expansion before the periodic timeout check at iteration 5000.
+    // The zero time budget makes this deterministic without sleeping or a test clock.
+    int iterations = 4999;
+    nav2_smac_planner::Node2D::CoordinateVector path;
+    const bool success = a_star.createPath(path, iterations, tolerance);
+    EXPECT_EQ(iterations, 5000);
+    if (tolerance > 1.0f) {
+      ASSERT_TRUE(success);
+      ASSERT_EQ(path.size(), 2u);
+      EXPECT_LT(std::hypot(path.front().x - 4.0f, path.front().y - 2.0f), tolerance);
+      EXPECT_FLOAT_EQ(path.back().x, 2.0f);
+      EXPECT_FLOAT_EQ(path.back().y, 2.0f);
+      for (const auto & pose : path) {
+        EXPECT_EQ(costmap.getCost(pose.x, pose.y), nav2_costmap_2d::FREE_SPACE);
+      }
+    } else {
+      EXPECT_FALSE(success);
+      EXPECT_TRUE(path.empty());
+    }
+  }
+}
+
 TEST(AStarTest, test_a_star_se2)
 {
   auto lnode = std::make_shared<rclcpp_lifecycle::LifecycleNode>("test");

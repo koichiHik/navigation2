@@ -86,8 +86,8 @@ public:
    * @param max_on_approach_iterations Maximum number of iterations before returning a valid
    * path once within thresholds to refine path
    * comes at more compute time but smoother paths.
-   * @param max_planning_time Maximum time (in seconds) to wait for a plan, createPath returns
-   * false after this timeout
+   * @param max_planning_time Maximum time (in seconds) to wait for a plan; on timeout,
+   * createPath returns the closest path within tolerance if available
    */
   void initialize(
     const bool & allow_unknown,
@@ -221,6 +221,13 @@ protected:
    * @return Are valid
    */
   inline bool areInputsValid();
+
+  /**
+   * @brief Get the closest path within tolerance if available
+   * @param path Vector of coordinates to fill with path
+   * @return If a valid path was found within tolerance
+   */
+  inline bool getClosestPathWithinTolerance(CoordinateVector & path);
 
   /**
    * @brief Clear hueristic queue of nodes to search

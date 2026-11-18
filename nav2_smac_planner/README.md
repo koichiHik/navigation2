@@ -29,6 +29,8 @@ Lattice rejects start or goal positions outside the current Costmap before searc
 
 Lattice motion-table reinitialization applies updated search penalties and reverse-expansion settings even when the primitive JSON path is unchanged, as in [PR #5478](https://github.com/ros-navigation/navigation2/pull/5478). Cached primitives are retained when only these settings change.
 
+A* returns the closest collision-checked path already found within the configured tolerance when its planning time expires, as in [PR #5578](https://github.com/ros-navigation/navigation2/pull/5578). Timeout still fails when no such path exists; the existing tolerance and backtrace checks are retained.
+
 The smoother's subsequent start/end boundary expansion still checks center cells, so [issue #6597](https://github.com/ros-navigation/navigation2/issues/6597) remains outside these changes. Exact requested goal-pose collision checking from the unmerged [PR #6633](https://github.com/ros-navigation/navigation2/pull/6633) and the multi-instance static-state changes are also not included. This package is not yet selected as PlannerMgmt's recovery strategy.
 
 The non-circular search-cost fix from [PR #4851](https://github.com/ros-navigation/navigation2/pull/4851) keeps polygon collision checking while returning the center-cell cost to the search. Humble's map-coordinate and heading conventions are retained.

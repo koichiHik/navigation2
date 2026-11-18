@@ -223,6 +223,15 @@ bool AStarAlgorithm<NodeT>::areInputsValid()
 }
 
 template<typename NodeT>
+bool AStarAlgorithm<NodeT>::getClosestPathWithinTolerance(CoordinateVector & path)
+{
+  if (_best_heuristic_node.first < getToleranceHeuristic()) {
+    return _graph.at(_best_heuristic_node.second).backtracePath(path);
+  }
+  return false;
+}
+
+template<typename NodeT>
 bool AStarAlgorithm<NodeT>::createPath(
   CoordinateVector & path, int & iterations,
   const float & tolerance)
@@ -270,7 +279,7 @@ bool AStarAlgorithm<NodeT>::createPath(
       std::chrono::duration<double> planning_duration =
         std::chrono::duration_cast<std::chrono::duration<double>>(steady_clock::now() - start_time);
       if (static_cast<double>(planning_duration.count()) >= _max_planning_time) {
-        return false;
+        return getClosestPathWithinTolerance(path);
       }
     }
 
@@ -330,12 +339,8 @@ bool AStarAlgorithm<NodeT>::createPath(
     }
   }
 
-  if (_best_heuristic_node.first < getToleranceHeuristic()) {
-    // If we run out of serach options, return the path that is closest, if within tolerance.
-    return _graph.at(_best_heuristic_node.second).backtracePath(path);
-  }
-
-  return false;
+  // If search options are exhausted, return the closest path if it is within tolerance.
+  return getClosestPathWithinTolerance(path);
 }
 
 template<typename NodeT>
