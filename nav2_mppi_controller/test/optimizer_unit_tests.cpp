@@ -117,6 +117,15 @@ public:
     EXPECT_EQ(generated_trajectories_.x, xt::zeros<float>({1000, 50}));
   }
 
+  void runOptimization(
+    const geometry_msgs::msg::PoseStamped & pose, const nav_msgs::msg::Path & path)
+  {
+    prepare(pose, geometry_msgs::msg::Twist{}, path, nullptr);
+    optimize();
+  }
+
+  const xt::xtensor<float, 1> & costs() const {return costs_;}
+
   bool fallbackWrapper(bool fail)
   {
     return fallback(fail);
@@ -754,5 +763,42 @@ TEST(OptimizerTests, integrateStateVelocitiesTests)
 
     EXPECT_NEAR(traj.x(1, i), x, 1e-6);
     EXPECT_NEAR(traj.y(1, i), y, 1e-6);
+  }
+}
+
+TEST(OptimizerTests, EachIterationUsesOnlyCurrentRolloutCosts)
+{
+  for (int iterations : {1, 2, 3}) {
+    auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("iteration_cost_test");
+    node->declare_parameter("controller_frequency", 20.0);
+    node->declare_parameter("mppi.batch_size", 4);
+    node->declare_parameter("mppi.time_steps", 8);
+    node->declare_parameter("mppi.iteration_count", iterations);
+    node->declare_parameter("mppi.gamma", 0.0);
+    node->declare_parameter("mppi.critics", std::vector<std::string>{"GoalCritic"});
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
+      "dummy_costmap", "", "dummy_costmap");
+    costmap->on_configure(rclcpp_lifecycle::State{});
+    ParametersHandler handler(node);
+    OptimizerTester optimizer;
+    optimizer.initialize(node, "mppi", costmap, &handler);
+    geometry_msgs::msg::PoseStamped pose;
+    pose.pose.orientation.w = 1.0;
+    nav_msgs::msg::Path path;
+    path.poses.resize(2);
+    path.poses.back().pose.position.x = 1.0;
+    optimizer.runOptimization(pose, path);
+
+    const auto & rollout = optimizer.getGeneratedTrajectories();
+    for (size_t i = 0; i < 4; ++i) {
+      float expected = 0.0f;
+      for (size_t j = 0; j < 8; ++j) {
+        expected += std::hypot(1.0f - rollout.x(i, j), rollout.y(i, j));
+      }
+      // GoalCritic weight 5, power 1. gamma=0 removes the control-cost term.
+      EXPECT_NEAR(optimizer.costs()(i), 5.0f * expected / 8.0f, 1e-4)
+        << "iterations=" << iterations;
+    }
+    optimizer.shutdown();
   }
 }
