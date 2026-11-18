@@ -230,7 +230,8 @@ TEST(UtilsTests, FurthestAndClosestReachedPoint)
   EXPECT_EQ(data2.furthest_reached_path_point, 0);
 
   // Test the actual computation of the path point reached
-  generated_trajectories.x = xt::ones<float>({100, 2});
+  generated_trajectories.x = xt::zeros<float>({100, 2});
+  xt::view(generated_trajectories.x, xt::all(), 1) = 1.0f;
   generated_trajectories.y = xt::zeros<float>({100, 2});
   generated_trajectories.yaws = xt::zeros<float>({100, 2});
 
@@ -246,7 +247,38 @@ TEST(UtilsTests, FurthestAndClosestReachedPoint)
   {state, generated_trajectories, path, costs, model_dt, false, nullptr, nullptr,
     std::nullopt, std::nullopt};  /// Caution, keep references
   EXPECT_EQ(findPathFurthestReachedPoint(data3), 5u);
-  EXPECT_EQ(findPathTrajectoryInitialPoint(data3), 5u);
+  EXPECT_EQ(findPathTrajectoryInitialPoint(data3), 0u);
+}
+
+TEST(UtilsTests, FurthestReachedPointDoesNotSkipUturn)
+{
+  models::State state;
+  models::Trajectories trajectories;
+  models::Path path;
+  xt::xtensor<float, 1> costs;
+  float model_dt = 0.1;
+  // The return branch is close in XY but more than 10 m along the path.
+  const float path_x[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 7, 6, 5, 4, 3, 2, 1, 0};
+  const float path_y[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+  path.reset(18);
+  for (size_t i = 0; i < 18; ++i) {
+    path.x(i) = path_x[i];
+    path.y(i) = path_y[i];
+  }
+  trajectories.reset(2, 4);
+  for (size_t i = 0; i < 2; ++i) {
+    for (size_t j = 0; j < 4; ++j) {
+      trajectories.x(i, j) = 5.0f * j / 3.0f;
+      trajectories.y(i, j) = static_cast<float>(j) / 3.0f;
+    }
+  }
+  CriticData data = {state, trajectories, path, costs, model_dt, false, nullptr, nullptr,
+    std::nullopt, std::nullopt};
+  EXPECT_EQ(findPathFurthestReachedPoint(data), 5u);
+
+  trajectories.x.fill(0.0f);
+  trajectories.y.fill(1.0f);
+  EXPECT_EQ(findPathFurthestReachedPoint(data), 0u);
 }
 
 TEST(UtilsTests, findPathCosts)

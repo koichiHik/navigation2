@@ -15,6 +15,8 @@ while retaining Humble's controller interface, parameter callbacks, and xtensor 
 - Fallback retry history belongs to each optimizer instance.
 - Absolute speed limits use `abs(vx_min)` when `vx_max` is zero. If both reference velocities are zero, the update is rejected and the current limits remain intact.
 
+- [#6055](https://github.com/ros-navigation/navigation2/pull/6055): bound critic path progress by each candidate trajectory's arc-length so nearby later branches of curved paths are not skipped. Adapted to Humble's xtensor implementation.
+
 These changes do not add main's newer controller API, motion models, or final optimized-trajectory validator. MPPI still requires the caller's motion validation before commands are used by the future recovery implementation.
 
 ![](media/demo.gif)

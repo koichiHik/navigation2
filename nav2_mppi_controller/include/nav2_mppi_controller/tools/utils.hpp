@@ -293,38 +293,57 @@ auto shortest_angular_distance(
 }
 
 /**
- * @brief Evaluate furthest point idx of data.path which is
- * nearset to some trajectory in data.trajectories
+ * @brief Find the furthest path point reached without exceeding each trajectory
+ * arc-length when matching nearby branches of a curved reference path
  * @param data Data to use
  * @return Idx of furthest path point reached by a set of trajectories
  */
 inline size_t findPathFurthestReachedPoint(const CriticData & data)
 {
-  const auto traj_x = xt::view(data.trajectories.x, xt::all(), -1, xt::newaxis());
-  const auto traj_y = xt::view(data.trajectories.y, xt::all(), -1, xt::newaxis());
+  const size_t path_size = data.path.x.size();
+  if (path_size == 0 || data.trajectories.x.size() == 0) {
+    return 0;
+  }
 
-  const auto dx = data.path.x - traj_x;
-  const auto dy = data.path.y - traj_y;
+  // A nearby later branch of a curved path is not necessarily reachable yet.
+  std::vector<float> path_integrated_dists(path_size, 0.0f);
+  for (size_t i = 1; i < path_size; ++i) {
+    const float dx = data.path.x(i) - data.path.x(i - 1);
+    const float dy = data.path.y(i) - data.path.y(i - 1);
+    path_integrated_dists[i] = path_integrated_dists[i - 1] + std::hypot(dx, dy);
+  }
 
-  const auto dists = dx * dx + dy * dy;
+  const size_t trajectory_size = data.trajectories.x.shape(1);
+  size_t furthest = 0;
+  for (size_t i = 0; i < data.trajectories.x.shape(0); ++i) {
+    float trajectory_length = 0.0f;
+    for (size_t j = 1; j < trajectory_size; ++j) {
+      trajectory_length += std::hypot(
+        data.trajectories.x(i, j) - data.trajectories.x(i, j - 1),
+        data.trajectories.y(i, j) - data.trajectories.y(i, j - 1));
+    }
+    const size_t reachable = std::min(
+      static_cast<size_t>(std::lower_bound(
+        path_integrated_dists.begin(), path_integrated_dists.end(), trajectory_length) -
+      path_integrated_dists.begin()), path_size - 1);
 
-  size_t max_id_by_trajectories = 0, min_id_by_path = 0;
-  float min_distance_by_path = std::numeric_limits<float>::max();
-  float cur_dist = 0.0f;
-
-  for (size_t i = 0; i < dists.shape(0); i++) {
-    min_id_by_path = 0;
-    min_distance_by_path = std::numeric_limits<float>::max();
-    for (size_t j = 0; j < dists.shape(1); j++) {
-      cur_dist = dists(i, j);
-      if (cur_dist < min_distance_by_path) {
-        min_distance_by_path = cur_dist;
-        min_id_by_path = j;
+    size_t nearest = 0;
+    float min_distance = std::numeric_limits<float>::max();
+    for (size_t j = 0; j <= reachable; ++j) {
+      const float dx = data.path.x(j) - data.trajectories.x(i, trajectory_size - 1);
+      const float dy = data.path.y(j) - data.trajectories.y(i, trajectory_size - 1);
+      const float distance = dx * dx + dy * dy;
+      if (distance < min_distance) {
+        min_distance = distance;
+        nearest = j;
       }
     }
-    max_id_by_trajectories = std::max(max_id_by_trajectories, min_id_by_path);
+    furthest = std::max(furthest, nearest);
+    if (furthest == path_size - 1) {
+      break;
+    }
   }
-  return max_id_by_trajectories;
+  return furthest;
 }
 
 /**
